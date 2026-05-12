@@ -2,70 +2,95 @@
 
 Configs + hooks + scripts for Medium post: **"How I Cut Claude Code Token Usage by 90%+"**.
 
+This repo is intentionally a **power-user default**: it assumes you want aggressive token control, enforcement hooks, and a local shell wrapper. If you want the full stack, run the default installer. If you want less global surface area, use the opt-out flags below.
+
 Post: [`claude-code-tips.md`](./claude-code-tips.md)
 
 Stack: **CBM** (code graph) + **context-mode** (output sandbox) + **RTK** (shell compression) + **Headroom** (API-layer) + **Caveman** (Claude output) + enforcement hooks. ~30min → 3h+ sessions, same 200K window.
 
-## Files
-
-| Path | Purpose |
-|---|---|
-| [`install.sh`](./install.sh) | One-click install — deps, hooks, settings, statusline, wrappers |
-| [`settings/settings.json`](./settings/settings.json) | `~/.claude/settings.json` — hooks, env, plugins, statusline |
-| [`CLAUDE.md.example`](./CLAUDE.md.example) | `~/.claude/CLAUDE.md` — in-session rules + tool routing |
-| [`hooks/bash-ban-raw-tools`](./hooks/bash-ban-raw-tools) | PreToolUse — blocks `cat`/`head`/`tail`/`find`/`grep`/`rg`/`wc` |
-| [`hooks/cbm-code-discovery-gate`](./hooks/cbm-code-discovery-gate) | PreToolUse — blocks `Grep`/`Glob`/`Read` on source until CBM called |
-| [`hooks/cbm-mcp-marker`](./hooks/cbm-mcp-marker) | PostToolUse — touches marker on CBM calls |
-| [`hooks/cbm-session-reminder`](./hooks/cbm-session-reminder) | SessionStart — re-injects CBM protocol post `/clear`, `/compact` |
-| [`statusline/statusline-command.sh`](./statusline/statusline-command.sh) | Statusline — user, branch, model, ctx%, 5h/7d usage |
-| [`rules/flutter.md`](./rules/flutter.md) · [`react.md`](./rules/react.md) · [`appwrite.md`](./rules/appwrite.md) | Per-stack self-check gates |
-| [`shell/claude.{fish,bash,zsh}`](./shell/) | Shell wrapper — `claude` → `headroom wrap claude` |
-
 ## Install
 
 ```bash
-chmod +x install.sh && ./install.sh
+git clone https://github.com/sgaabdu4/claude-code-tips.git
+cd claude-code-tips && chmod +x install.sh && ./install.sh
 ```
 
-Backs up existing `~/.claude/settings.json`. Tune `model` / `effortLevel` / `advisorModel` post-install.
+Sanity-checks `git`/`curl`/`jq`/`python3` upfront. Installs Headroom (`pip install --user`), CBM binary, context-mode + Caveman plugins via `claude plugin install`, hooks, slash commands, statusline, settings, shell wrapper for your `$SHELL`. **Idempotent** — re-run anytime.
 
-## Manual install
+### Power-user flags
+
+Default stays maximal. These flags narrow blast radius without editing the script:
 
 ```bash
-mkdir -p ~/.claude/hooks ~/.claude/rules
-cp hooks/* ~/.claude/hooks/ && chmod +x ~/.claude/hooks/*
-cp rules/*.md ~/.claude/rules/
-cp ~/.claude/settings.json{,.bak} 2>/dev/null || true
-cp settings/settings.json ~/.claude/settings.json
-cp CLAUDE.md.example ~/.claude/CLAUDE.md
-cp statusline/statusline-command.sh ~/.claude/ && chmod +x ~/.claude/statusline-command.sh
-
-# Shell wrapper — pick one
-cat shell/claude.fish >> ~/.config/fish/config.fish
-cat shell/claude.bash >> ~/.bashrc
-cat shell/claude.zsh  >> ~/.zshrc
+./install.sh --no-shell-wrapper   # install Headroom/RTK, but do not alias claude
+./install.sh --no-caveman         # skip Caveman plugin + omit it from settings
+./install.sh --sonnet             # use model: sonnet + effortLevel: high
+./install.sh --check              # validate repo wiring only
 ```
 
-Then install externals:
+`--no-shell-wrapper` is the safer alternative to skipping Headroom entirely: this stack relies on Headroom to provide RTK, so the flag keeps the binary installed while making API-layer compression an explicit `headroom wrap claude` launch choice.
+
+### Existing setup? Don't worry
+
+- `~/.claude/CLAUDE.md` — your content preserved. Our framework is prepended inside `<!--cct-->`/`<!--/cct-->` markers. Re-runs replace inside markers; everything outside untouched.
+- `~/.claude/settings.json` — `jq` deep merge. Your `model` / `effortLevel` / `permissions` / custom env keys preserved. Our `hooks` and framework env added.
+- `~/.claude/{hooks,commands,rules,bin}/*` — per-file: if a target exists and differs from ours, renamed to `<name>.bak.<timestamp>` before overwrite. Identical files: no-op.
+- `~/.claude/agents/*` — intentionally untouched. Keep your private subagent definitions outside this public repo.
+
+### Validate
+
+```bash
+./install.sh --check
+```
+
+Walks `settings.json`, asserts every hook command path resolves on disk, every `mcp__plugin_*` reference in commands has a matching `enabledPlugins` entry, every `bin/` script referenced by a hook exists. Catches "hook referenced but not installed" forever.
+
+## Layout
+
+| Path | Purpose |
+|---|---|
+| [`install.sh`](./install.sh) | One-click power-user install. Supports `--check`, `--no-shell-wrapper`, `--no-caveman`, and `--sonnet`. |
+| [`settings/settings.json`](./settings/settings.json) | `~/.claude/settings.json` — model, effort, hooks, env, plugins, statusline |
+| [`CLAUDE.md.example`](./CLAUDE.md.example) | Body of `~/.claude/CLAUDE.md` — rules + tool routing. Wrapped in `<!--cct-->` markers when installed |
+| [`hooks/`](./hooks/) | All enforcement hooks (cbm-*, bash-ban-raw-tools, sync-*-on-edit, flutter-ctx-redirect, memory-repo-symlink) |
+| [`commands/`](./commands/) | Slash commands (`/e2e`, `/e2e-auto`, `/unleash`, `/ship`) |
+| [`rules/`](./rules/) | **Empty by design** — your stack-specific rules. See [`rules/README.md`](./rules/README.md) for the template |
+| [`bin/`](./bin/) | Helper scripts (`sync-copilot.mjs`, `sync-runner-tools.mjs`) referenced by hooks |
+| [`statusline/statusline-command.sh`](./statusline/statusline-command.sh) | Statusline — user, branch, model, ctx%, 5h/7d usage |
+
+Subagent definitions are private by design. The commands can call local agents from `~/.claude/agents/`, but this repo does not ship or overwrite them.
+
+## Hook map
+
+```
+shell wrapper           claude → headroom wrap claude
+PreToolUse(Bash)        context-mode + bash-ban-raw-tools + flutter-ctx-redirect + rtk
+PreToolUse(Grep|...)    cbm-code-discovery-gate
+PostToolUse             context-mode + cbm-mcp-marker
+PostToolUse(Edit|Write) sync-copilot-on-edit + sync-runner-tools-on-edit
+PreCompact              context-mode
+SessionStart            context-mode + memory-repo-symlink + cbm-session-reminder
+```
+
+## Externals (auto-installed by `install.sh`)
 
 | Tool | Repo |
 |---|---|
 | Headroom (bundles RTK) | https://github.com/chopratejas/headroom |
 | codebase-memory-mcp | https://github.com/DeusData/codebase-memory-mcp |
-| context-mode | https://github.com/mksglu/context-mode |
+| context-mode plugin | https://github.com/mksglu/context-mode |
 | Caveman plugin | https://github.com/JuliusBrussee/caveman |
 | RTK standalone | https://github.com/rtk-ai/rtk |
 
-Restart: `exec $SHELL`. Run `claude` — auto-wraps via Headroom. `/caveman` → compressed output.
+### Optional — required only for `/e2e` and `/e2e-auto`
 
-## Layer map
+| Tool | Install |
+|---|---|
+| flutter-driver-mcp (Flutter projects) | `claude mcp add --transport stdio flutter-driver -- npx flutter-driver-mcp` |
+| agent-browser (web projects) | `npm install -g agent-browser` |
 
-```
-shell wrapper → headroom wrap claude
-  PreToolUse:  bash-ban-raw-tools + cbm-code-discovery-gate + context-mode
-  PostToolUse: cbm-mcp-marker + context-mode
-  SessionStart: cbm-session-reminder + context-mode
-  plugin: caveman (output compression)
-  config: CLAUDE.md + rules/*
-  RTK: bundled in Headroom, compresses shell output
-```
+`install.sh` does **not** install these — the e2e commands abort with the relevant install hint if you run them without the tool.
+
+## Read the full story
+
+The Medium post walks through the *why* of each layer, the failure modes that drove every hook, and the cost math. Start there: [`claude-code-tips.md`](./claude-code-tips.md).

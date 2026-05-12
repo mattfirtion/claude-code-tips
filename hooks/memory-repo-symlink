@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# SessionStart hook: point ~/.claude/projects/<slug>/memory at <repo>/.claude/memory
+# so memory files live inside the repo (committable, shareable).
+set -euo pipefail
+
+cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+# Only operate inside git repos.
+repo_root="$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$repo_root" ] || exit 0
+
+# Encode path the way Claude Code does: / and . become -
+slug="$(printf '%s' "$repo_root" | sed 's|[/.]|-|g')"
+projects_memory="$HOME/.claude/projects/${slug}/memory"
+# For the ~/.claude config repo itself, store at <root>/memory (no nested .claude).
+if [ "$repo_root" = "$HOME/.claude" ]; then
+  repo_memory="${repo_root}/memory"
+else
+  repo_memory="${repo_root}/.claude/memory"
+fi
+
+mkdir -p "$repo_memory"
+mkdir -p "$(dirname "$projects_memory")"
+
+# Already correct symlink → done.
+if [ -L "$projects_memory" ] && [ "$(readlink "$projects_memory")" = "$repo_memory" ]; then
+  exit 0
+fi
+
+# Existing real dir with contents → move them into repo first.
+if [ -d "$projects_memory" ] && [ ! -L "$projects_memory" ]; then
+  shopt -s dotglob nullglob
+  files=("$projects_memory"/*)
+  if [ ${#files[@]} -gt 0 ]; then
+    mv "${files[@]}" "$repo_memory"/
+  fi
+  rmdir "$projects_memory" 2>/dev/null || true
+fi
+
+# Stale symlink pointing elsewhere → replace.
+if [ -L "$projects_memory" ]; then
+  rm "$projects_memory"
+fi
+
+ln -s "$repo_memory" "$projects_memory"

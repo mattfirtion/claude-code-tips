@@ -20,7 +20,14 @@ Every impl task. Skip step → STOP, restart from skipped.
 Subagents inherit nothing auto. Your `.md` must declare `skills:` frontmatter + reference flow.
 
 ## Skill gates
-Dart/Flutter → `building-flutter-apps` FIRST. React/Next → `vercel-react-best-practices` FIRST. Appwrite → `appwrite-backend` FIRST. Checklists: `.claude/rules/`.
+Pattern: file from stack X touched → invoke skill X FIRST. No skip.
+
+Setup per stack:
+1. Create `~/.claude/rules/<stack>.md` (optional `paths:` frontmatter scopes by glob)
+2. First body line after frontmatter: `Invoke <skill-name> FIRST`
+3. Numbered self-check below — footguns Claude trip on
+
+Empty `rules/` → no-op, general behaviour applies. Template: `rules/README.md`. Add rules as codebase grow.
 
 ## Ripple check — NON-NEGOTIABLE
 Edit one site, miss others → break. Any add/change/remove: grep symbol + CBM `trace_path` ALL usages. Update every call site. Linter miss loose types/`dynamic`/`any`/optional. Never trust "only used here".
@@ -69,9 +76,6 @@ Delegate default. Main = coordinator.
 - **Model**: default sonnet via env. Override `model: claude-opus-4-7` for refactor/audit/multi-file impact/edge-case-hunter/staff-engineer.
 - Big task → advisor after.
 
-## Handoff
-PreCompact hook auto-write `docs/handoff-context.md` via `claude -p --bare`. SessionStart hook (matcher compact|resume) auto-inline. Manual `/handoff` anytime. Delete file after resume.
-
 ## Writing
 Active voice. Concrete. No puffery (robust/seamless/leverage/delve/pivotal/groundbreaking/multifaceted/foster/tapestry). Mermaid when diagram > prose.
 
@@ -84,4 +88,66 @@ Post-`/compact`: re-discover tools via `ToolSearch`. Long task: checkpoint to au
 ## Per-project
 Project `CLAUDE.md` overrides. Read `CLAUDE.md`/`architecture.md`/`/docs` before cross-cutting.
 
-@RTK.md
+# Codebase Knowledge Graph (codebase-memory-mcp)
+
+Project use codebase-memory-mcp for codebase knowledge graph.
+ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.
+
+## Priority Order
+1. `search_graph` — find functions, classes, routes, variables by pattern
+2. `trace_path` — trace caller/callee
+3. `get_code_snippet` — read function/class source
+4. `query_graph` — Cypher complex patterns
+5. `get_architecture` — high-level summary
+
+## When to fall back to grep/glob
+- String literals, error messages, config values
+- Non-code files (Dockerfiles, shell scripts, configs)
+- MCP tools insufficient
+
+## Examples
+- Find handler: `search_graph(name_pattern=".*OrderHandler.*")`
+- Callers: `trace_path(function_name="OrderHandler", direction="inbound")`
+- Read source: `get_code_snippet(qualified_name="pkg/orders.OrderHandler")`
+
+## CBM transport-closed → CLI fallback
+MCP `mcp__codebase-memory-mcp__*` PRIMARY. On `Transport closed`/`MCP error -32000`/reset → retry SAME tool via CLI in `ctx_execute(shell)`. Never silent-grep. Binary `cbm` = `~/.local/bin/codebase-memory-mcp`. Envelope `{content:[{type:text,text:<json>}]}` → strip `jq -r '.content[0].text' | jq`. (`--raw` broken v0.6.0.)
+
+Pattern:
+```bash
+cbm cli <tool> '<json>' | jq -r '.content[0].text' | jq '<filter>'
+```
+
+MCP→CLI map: tool name identical, drop `mcp__codebase-memory-mcp__` prefix. All accept JSON arg `'{"project":"<name>", ...}'` match MCP schema. 14 tools: `list_projects index_status index_repository detect_changes get_architecture search_graph search_code trace_path get_code_snippet query_graph get_graph_schema delete_project manage_adr ingest_traces`.
+
+One-time: `cbm config set auto_index true` (MCP session auto-index dead when transport dead).
+
+Flow: MCP → fail-transport → CLI in `ctx_execute(shell)` → fail → surface error → grep last.
+
+# RTK - Rust Token Killer
+
+**Usage**: Token-optimized CLI proxy (60-90% savings on dev ops)
+
+## Meta Commands (always use rtk directly)
+
+```bash
+rtk gain              # Show token savings analytics
+rtk gain --history    # Show command usage history with savings
+rtk discover          # Analyze Claude Code history for missed opportunities
+rtk proxy <cmd>       # Execute raw command without filtering (for debugging)
+```
+
+## Installation Verification
+
+```bash
+rtk --version         # Should show: rtk X.Y.Z
+rtk gain              # Should work (not "command not found")
+which rtk             # Verify correct binary
+```
+
+⚠️ **Name collision**: `rtk gain` fail → maybe reachingforthejack/rtk (Rust Type Kit) installed.
+
+## Hook-Based Usage
+
+Other commands auto-rewritten by Claude Code hook.
+Example: `git status` → `rtk git status` (transparent, 0 tokens overhead)

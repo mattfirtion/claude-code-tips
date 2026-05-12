@@ -1,460 +1,555 @@
 #!/bin/bash
 set -euo pipefail
 
+print_usage() {
+  cat <<'EOF'
+Claude Code Token Optimization Stack installer
+
+Usage:
+  ./install.sh [options]
+
+Power-user default:
+  Installs Headroom + RTK, CBM, context-mode, Caveman, hooks, commands,
+  statusline, settings, and the shell wrapper that runs `claude` through
+  Headroom.
+
+Options:
+  --check              Validate repo settings/hooks/commands without installing.
+  --no-shell-wrapper   Install Headroom, but do not modify your shell rc to wrap `claude`.
+  --no-caveman         Skip Caveman plugin install and omit it from merged settings.
+  --sonnet             Use `model: sonnet` and `effortLevel: high` instead of Opus/xhigh.
+  -h, --help           Show this help.
+
+Examples:
+  ./install.sh
+  ./install.sh --no-shell-wrapper
+  ./install.sh --no-caveman --sonnet
+  ./install.sh --check --no-caveman --sonnet
+EOF
+}
+
+CHECK_ONLY=0
+INSTALL_CAVEMAN=1
+INSTALL_SHELL_WRAPPER=1
+MODEL_PROFILE="power"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check)
+      CHECK_ONLY=1
+      shift
+      ;;
+    --no-shell-wrapper)
+      INSTALL_SHELL_WRAPPER=0
+      shift
+      ;;
+    --no-caveman)
+      INSTALL_CAVEMAN=0
+      shift
+      ;;
+    --sonnet)
+      MODEL_PROFILE="sonnet"
+      shift
+      ;;
+    -h|--help)
+      print_usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      print_usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SETTINGS_SOURCE="$REPO_DIR/settings/settings.json"
+SETTINGS_TMP=""
+
+cleanup_tmp() {
+  [[ -n "${SETTINGS_TMP:-}" ]] && rm -f "$SETTINGS_TMP"
+  return 0
+}
+trap cleanup_tmp EXIT
+
+prepare_settings_source() {
+  local filter='.'
+
+  if [[ "$INSTALL_CAVEMAN" -eq 0 ]]; then
+    filter="$filter | del(.enabledPlugins[\"caveman@caveman\"]) | del(.extraKnownMarketplaces.caveman)"
+  fi
+
+  if [[ "$MODEL_PROFILE" == "sonnet" ]]; then
+    filter="$filter | .model = \"sonnet\" | .effortLevel = \"high\""
+  fi
+
+  if [[ "$filter" != "." ]]; then
+    SETTINGS_TMP="$(mktemp)"
+    jq "$filter" "$REPO_DIR/settings/settings.json" > "$SETTINGS_TMP"
+    SETTINGS_SOURCE="$SETTINGS_TMP"
+  fi
+}
+
+# ── Validator mode ──
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  echo "=== install.sh --check ==="
+  fail=0
+
+  # 1. JSON syntax
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "FAIL: jq not installed (required by hooks + check mode)"; fail=1
+  else
+    prepare_settings_source
+    if ! jq empty "$SETTINGS_SOURCE" 2>/dev/null; then
+      echo "FAIL: settings/settings.json is not valid JSON"; fail=1
+    fi
+  fi
+
+  # 2. Every hook command path in settings resolves to a file in repo hooks/
+  if command -v jq >/dev/null 2>&1; then
+    while IFS= read -r cmd; do
+      [[ -z "$cmd" ]] && continue
+      hook_path="${cmd//\~/$HOME}"
+      hook_path="${hook_path%% *}"
+      [[ "$hook_path" == "$HOME/.claude/hooks/"* ]] || continue
+      hook_name="${hook_path##*/}"
+      if [[ ! -f "$REPO_DIR/hooks/$hook_name" ]]; then
+        echo "FAIL: settings.json references hook '$hook_name' but $REPO_DIR/hooks/$hook_name missing"; fail=1
+      fi
+    done < <(jq -r '[.. | objects | select(.command? != null) | .command] | .[]' "$SETTINGS_SOURCE")
+  fi
+
+  # 3. Every commands/*.md plugin reference resolves to an enabled plugin
+  while IFS= read -r f; do
+    while IFS= read -r ref; do
+      plugin="${ref#mcp__plugin_}"
+      plugin="${plugin%%_*}"
+      if ! jq -e --arg p "$plugin" '.enabledPlugins | keys[] | select(startswith($p))' "$SETTINGS_SOURCE" >/dev/null 2>&1; then
+        echo "FAIL: $f references mcp__plugin_${plugin}_* but no '$plugin@*' enabled in settings"; fail=1
+      fi
+    done < <(grep -oE 'mcp__plugin_[a-z0-9_-]+' "$f" 2>/dev/null | sort -u)
+  done < <(find "$REPO_DIR/commands" -name '*.md' 2>/dev/null)
+
+  # 4. bin/ scripts referenced by hooks must exist
+  for script in sync-copilot.mjs sync-runner-tools.mjs; do
+    if grep -rqE "bin/$script" "$REPO_DIR/hooks/" 2>/dev/null; then
+      [[ -f "$REPO_DIR/bin/$script" ]] || { echo "FAIL: hooks reference bin/$script but $REPO_DIR/bin/$script missing"; fail=1; }
+    fi
+  done
+
+  if [[ $fail -eq 0 ]]; then
+    echo "OK: all hooks, command plugin refs, and bin/ scripts resolve"
+    exit 0
+  fi
+  exit 1
+fi
+
 echo "=== Claude Code Token Optimization Stack ==="
-echo "Installing: Headroom + RTK + CBM + context-mode + Caveman + hooks"
+echo "Installing: Headroom + RTK + CBM + context-mode + hooks"
+if [[ "$INSTALL_CAVEMAN" -eq 1 ]]; then
+  echo "Power-user output compression: Caveman enabled"
+else
+  echo "Power-user output compression: Caveman skipped (--no-caveman)"
+fi
+if [[ "$INSTALL_SHELL_WRAPPER" -eq 1 ]]; then
+  echo "Shell wrapper: enabled (claude → headroom wrap claude)"
+else
+  echo "Shell wrapper: skipped (--no-shell-wrapper)"
+fi
+if [[ "$MODEL_PROFILE" == "sonnet" ]]; then
+  echo "Model profile: sonnet/high (--sonnet)"
+else
+  echo "Model profile: opus/xhigh"
+fi
 echo ""
 
+# ── 0. Sanity-check required tools ──
+# Hooks rely on jq; install.sh's --check validator does too. Catch missing
+# tools up front with one clear message rather than cryptic errors mid-run.
+missing=""
+for cmd in git curl jq python3; do
+  command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
+done
+if [[ -n "$missing" ]]; then
+  echo "❌ Missing required tools:$missing"
+  echo "   macOS:  brew install$missing"
+  echo "   Debian: sudo apt-get install -y$missing"
+  echo "   Re-run install.sh once they are on PATH."
+  exit 1
+fi
+
+prepare_settings_source
+
 # ── 1. Install Headroom (includes RTK) ──
+# `--user` keeps us off the system Python and dodges PEP 668
+# "externally-managed-environment" errors on Homebrew Python 3.11+ /
+# Debian-flavour distros. Falls back to plain pip if --user is unsupported
+# (e.g. a venv where --user makes no sense).
 echo "→ Installing Headroom..."
-pip install "headroom-ai[all]" 2>/dev/null || pip3 install "headroom-ai[all]"
+HR_CMD=""
+if command -v pip3 >/dev/null 2>&1; then HR_CMD="pip3"
+elif command -v pip  >/dev/null 2>&1; then HR_CMD="pip"
+fi
+if [[ -n "$HR_CMD" ]]; then
+  "$HR_CMD" install --user "headroom-ai[all]" 2>/dev/null \
+    || "$HR_CMD" install "headroom-ai[all]" 2>/dev/null \
+    || echo "  ⚠ pip install failed. Run manually: $HR_CMD install --user 'headroom-ai[all]'"
+else
+  echo "  ⚠ pip / pip3 not found — install Python 3 + pip, then run: pip install --user 'headroom-ai[all]'"
+fi
 
 # ── 2. Install codebase-memory-mcp ──
+# Releases ship as <name>-<os>-<arch>.tar.gz. We download, extract the binary,
+# and drop it in ~/.local/bin (caller is expected to have ~/.local/bin on PATH).
 echo "→ Installing codebase-memory-mcp..."
-if [[ "$(uname)" == "Darwin" ]]; then
-  if [[ "$(uname -m)" == "arm64" ]]; then
-    CBM_URL="https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/codebase-memory-mcp-aarch64-apple-darwin"
+CBM_OS=""
+CBM_ARCH=""
+case "$(uname)" in
+  Darwin) CBM_OS="darwin" ;;
+  Linux)  CBM_OS="linux" ;;
+  *) echo "  ⚠ Unsupported OS: $(uname). Skipping CBM install."; CBM_OS="" ;;
+esac
+case "$(uname -m)" in
+  arm64|aarch64)  CBM_ARCH="arm64" ;;
+  x86_64|amd64)   CBM_ARCH="amd64" ;;
+  *) echo "  ⚠ Unsupported arch: $(uname -m). Skipping CBM install."; CBM_ARCH="" ;;
+esac
+if [[ -n "$CBM_OS" && -n "$CBM_ARCH" ]]; then
+  CBM_URL="https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/codebase-memory-mcp-${CBM_OS}-${CBM_ARCH}.tar.gz"
+  mkdir -p "$HOME/.local/bin"
+  CBM_TMP="$(mktemp -d)"
+  if curl -fsSL "$CBM_URL" -o "$CBM_TMP/cbm.tar.gz"; then
+    tar -xzf "$CBM_TMP/cbm.tar.gz" -C "$CBM_TMP"
+    if [[ -f "$CBM_TMP/codebase-memory-mcp" ]]; then
+      mv "$CBM_TMP/codebase-memory-mcp" "$HOME/.local/bin/codebase-memory-mcp"
+      chmod +x "$HOME/.local/bin/codebase-memory-mcp"
+      "$HOME/.local/bin/codebase-memory-mcp" setup claude-code 2>/dev/null || true
+      echo "  ✓ CBM installed at ~/.local/bin/codebase-memory-mcp"
+    else
+      echo "  ⚠ CBM tarball extracted but binary not found — open an issue at the repo"
+    fi
   else
-    CBM_URL="https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/codebase-memory-mcp-x86_64-apple-darwin"
+    echo "  ⚠ CBM download failed ($CBM_URL). Skip and run manually later."
   fi
-elif [[ "$(uname)" == "Linux" ]]; then
-  CBM_URL="https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/codebase-memory-mcp-x86_64-unknown-linux-gnu"
+  rm -rf "$CBM_TMP"
 fi
-mkdir -p "$HOME/.local/bin"
-curl -fsSL "$CBM_URL" -o "$HOME/.local/bin/codebase-memory-mcp"
-chmod +x "$HOME/.local/bin/codebase-memory-mcp"
-# Auto-configure for Claude Code
-"$HOME/.local/bin/codebase-memory-mcp" setup claude-code 2>/dev/null || true
 
-# ── 3. Install context-mode ──
-echo "→ Installing context-mode..."
-claude mcp add context-mode -- npx -y context-mode 2>/dev/null || echo "  (run 'claude mcp add context-mode -- npx -y context-mode' manually if this failed)"
+# ── 3. Install Claude Code plugins (context-mode + optional caveman) ──
+# Plugin install (not raw `mcp add`) so context-mode tools resolve under
+# `mcp__plugin_context-mode_context-mode__*` — the namespace slash commands
+# (/e2e, /unleash) reference. Raw `mcp add` produces `mcp__context-mode__*`
+# which the slash commands cannot find. Caveman stays enabled by default for
+# the power-user profile, but --no-caveman keeps private style choices out of
+# the merged settings.
+if [[ "$INSTALL_CAVEMAN" -eq 1 ]]; then
+  echo "→ Installing Claude Code plugins (context-mode, caveman)..."
+else
+  echo "→ Installing Claude Code plugins (context-mode only; Caveman skipped)..."
+fi
+if ! command -v claude >/dev/null 2>&1; then
+  echo "  ⚠ 'claude' CLI not on PATH. Skip plugin install — install Claude Code first, then run:"
+  echo "    claude plugin marketplace add mksglu/context-mode && claude plugin install context-mode@context-mode"
+  if [[ "$INSTALL_CAVEMAN" -eq 1 ]]; then
+    echo "    claude plugin marketplace add JuliusBrussee/caveman && claude plugin install caveman@caveman"
+  fi
+else
+  claude plugin marketplace add mksglu/context-mode 2>/dev/null \
+    || echo "  (run 'claude plugin marketplace add mksglu/context-mode' manually if this failed)"
+  claude plugin install context-mode@context-mode 2>/dev/null \
+    || echo "  (run 'claude plugin install context-mode@context-mode' manually if this failed)"
+  if [[ "$INSTALL_CAVEMAN" -eq 1 ]]; then
+    claude plugin marketplace add JuliusBrussee/caveman 2>/dev/null \
+      || echo "  (run 'claude plugin marketplace add JuliusBrussee/caveman' manually if this failed)"
+    claude plugin install caveman@caveman 2>/dev/null \
+      || echo "  (run 'claude plugin install caveman@caveman' manually if this failed)"
+  fi
+fi
 
 # ── 4. Install tvly CLI (Tavily search/extract) ──
 echo "→ Installing tvly CLI..."
-npm install -g tavily-cli 2>/dev/null || echo "  (run 'npm install -g tavily-cli' manually if this failed)"
+if command -v npm >/dev/null 2>&1; then
+  npm install -g tavily-cli 2>/dev/null \
+    || echo "  ⚠ npm install -g tavily-cli failed — run manually after this script."
+else
+  echo "  ⚠ npm not found — install Node.js (https://nodejs.org), then 'npm install -g tavily-cli'."
+fi
 echo "  Export TAVILY_API_KEY in your shell rc (get key at tavily.com)."
 
-# ── 5. Create hooks directory ──
-echo "→ Creating hooks..."
-mkdir -p "$HOME/.claude/hooks"
-
-# ── Hook: bash-ban-raw-tools ──
-cat > "$HOME/.claude/hooks/bash-ban-raw-tools" << 'HOOKEOF'
-#!/bin/bash
-set -euo pipefail
-INPUT=$(cat)
-TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty')
-[ "$TOOL" = "Bash" ] || exit 0
-UNLOCK=/tmp/bash-raw-unlock
-check_unlock() {
-  local f=$1; [ -f "$f" ] || return 1
-  local mtime; mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)
-  local age=$(( $(date +%s) - mtime ))
-  if [ "$age" -lt 600 ]; then return 0; fi; rm -f "$f"; return 1
-}
-check_unlock "$UNLOCK" && exit 0
-check_unlock "/tmp/bash-raw-unlock-$PPID" && exit 0
-CMD=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
-TRIMMED=$(echo "$CMD" | sed -E 's/^[[:space:]]*//')
-FIRST=$(echo "$TRIMMED" | awk '{print $1}')
-banned=0
-case "$FIRST" in cat|head|tail|find|grep|rg|wc) banned=1 ;; rtk) exit 0 ;; esac
-if echo "$CMD" | grep -qE '\|\s*(tail|head)\b' && echo "$FIRST" | grep -qE '^(cat|grep|rg|find)$'; then
-  echo "BLOCKED: pipe truncation. Use ctx_batch_execute instead." >&2; exit 2
-fi
-[ "$banned" -eq 0 ] && exit 0
-case "$FIRST" in
-  cat|head|tail) echo "BLOCKED '$FIRST'. Use Read tool." >&2 ;;
-  find) echo "BLOCKED 'find'. Use Glob tool." >&2 ;;
-  grep|rg) echo "BLOCKED '$FIRST'. Use Grep tool." >&2 ;;
-  wc) echo "BLOCKED 'wc'. Use Read." >&2 ;;
-esac
-exit 2
-HOOKEOF
-
-# ── Hook: cbm-code-discovery-gate ──
-cat > "$HOME/.claude/hooks/cbm-code-discovery-gate" << 'HOOKEOF'
-#!/bin/bash
-set -euo pipefail
-INPUT=$(cat)
-TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty')
-UNLOCK=/tmp/cbm-unlock-$PPID
-MARKER=/tmp/cbm-mcp-used-$PPID
-[ -f "$UNLOCK" ] && exit 0
-find /tmp -maxdepth 1 -name 'cbm-*' -mtime +1 -delete 2>/dev/null || true
-case "$TOOL" in
-  Grep)
-    GLOB=$(echo "$INPUT" | jq -r '.tool_input.glob // ""')
-    TYPE=$(echo "$INPUT" | jq -r '.tool_input.type // ""')
-    PATH_Q=$(echo "$INPUT" | jq -r '.tool_input.path // ""')
-    if [[ "$GLOB" =~ \.(json|yaml|yml|md|toml|lock|txt|env)$ ]] \
-      || [[ "$TYPE" =~ ^(json|yaml|md|toml|txt)$ ]] \
-      || [[ "$PATH_Q" =~ (\.claude|settings|CLAUDE\.md|/tmp/|/var/) ]]; then exit 0; fi
-    echo "BLOCKED Grep on source code. Use codebase-memory-mcp first. Override: touch $UNLOCK." >&2; exit 2 ;;
-  Glob)
-    PATTERN=$(echo "$INPUT" | jq -r '.tool_input.pattern // ""')
-    if [[ "$PATTERN" =~ \.(dart|ts|tsx|js|jsx|py|go|rs|java|kt|swift)$ ]] \
-      || [[ "$PATTERN" =~ ^(lib|src|app)/ ]]; then
-      echo "BLOCKED Glob on source tree. Use codebase-memory-mcp first. Override: touch $UNLOCK." >&2; exit 2
-    fi ;;
-  Read)
-    FP=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
-    if [[ "$FP" =~ \.(json|yaml|yml|md|toml|lock|txt|env|sh)$ ]] \
-      || [[ "$FP" =~ (\.claude|CLAUDE\.md|settings|hooks/|/test/|_test\.) ]]; then exit 0; fi
-    if [ -f "$MARKER" ]; then
-      AGE=$(( $(date +%s) - $(stat -f %m "$MARKER" 2>/dev/null || stat -c %Y "$MARKER" 2>/dev/null || echo 0) ))
-      [ "$AGE" -lt 120 ] && exit 0
-    fi
-    echo "BLOCKED Read on source file. Use codebase-memory-mcp first. Override: touch $UNLOCK." >&2; exit 2 ;;
-esac
-exit 0
-HOOKEOF
-
-# ── Hook: cbm-mcp-marker ──
-cat > "$HOME/.claude/hooks/cbm-mcp-marker" << 'HOOKEOF'
-#!/bin/bash
-set -euo pipefail
-INPUT=$(cat)
-TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty')
-if [[ "$TOOL" == mcp__codebase-memory-mcp__* ]]; then
-  touch /tmp/cbm-mcp-used-$PPID
-fi
-exit 0
-HOOKEOF
-
-# ── Hook: cbm-session-reminder ──
-cat > "$HOME/.claude/hooks/cbm-session-reminder" << 'HOOKEOF'
-#!/bin/bash
-cat << 'REMINDER'
-CRITICAL - Code Discovery Protocol:
-1. ALWAYS use codebase-memory-mcp tools FIRST for ANY code exploration:
-   - search_graph to find functions/classes/routes
-   - trace_path for call chains
-   - get_code_snippet to read source
-   - query_graph for complex patterns
-   - get_architecture for project structure
-2. Fall back to Grep/Glob/Read ONLY for non-code files.
-3. If a project is not indexed yet, run index_repository FIRST.
-REMINDER
-HOOKEOF
-
-# ── Hook: handoff-precompact ──
-cat > "$HOME/.claude/hooks/handoff-precompact" << 'HOOKEOF'
-#!/usr/bin/env bash
-# PreCompact hook — auto-synthesize handoff JSON before compaction.
-# Calls claude -p --bare headless with transcript tail; falls back to raw dump.
-set -uo pipefail
-INPUT=$(cat)
-TRANSCRIPT=$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
-CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // "."' 2>/dev/null)
-[[ -z "${TRANSCRIPT:-}" || ! -f "$TRANSCRIPT" ]] && exit 0
-[[ -z "${CWD:-}" ]] && CWD="."
-mkdir -p "$CWD/docs"
-OUT="$CWD/docs/handoff-context.md"
-PROMPT='You are generating a session handoff for the NEXT Claude Code session. Read the transcript provided below. Output STRICT JSON ONLY — no preamble, no prose, no markdown fences. Schema: {"session_started":"ISO8601","task":"one sentence","completed_tasks":[],"current_state":"...","constraints_to_preserve":["verbatim user rules"],"files_touched":[{"path":"","status":"created|modified|deleted","summary":""}],"issues_discovered":[],"open_questions":[],"next_steps":["ordered, next_steps[0] first"],"resume_prompt":"one paragraph"}. Quote user rules verbatim. Concrete not vague. Must parse as valid JSON.'
-TIMEOUT_BIN=""
-if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout 60"
-elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout 60"
-else TIMEOUT_BIN="perl -e \"alarm 60; exec @ARGV or die\" --"
-fi
-run_with_claude() {
-  command -v claude >/dev/null 2>&1 || return 1
-  { printf '%s\n\nTRANSCRIPT (JSONL, newest last):\n' "$PROMPT"; tail -c 200000 "$TRANSCRIPT"; } \
-    | eval "$TIMEOUT_BIN claude -p --bare --model claude-sonnet-4-6 --output-format text" > "$OUT.tmp" 2>/dev/null
-  if [[ -s "$OUT.tmp" ]] && jq empty < "$OUT.tmp" >/dev/null 2>&1; then mv "$OUT.tmp" "$OUT"; return 0; fi
-  rm -f "$OUT.tmp"; return 1
-}
-fallback_raw_dump() {
-  { printf '{"status":"HANDOFF_AUTO_PARTIAL","note":"claude -p unavailable or failed; raw transcript tail below.","transcript_path":"%s","generated_at":"%s"}\n' "$TRANSCRIPT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; printf '\n---RAW_TRANSCRIPT_TAIL---\n'; tail -c 50000 "$TRANSCRIPT"; } > "$OUT"
-}
-run_with_claude || fallback_raw_dump
-exit 0
-HOOKEOF
-
-# ── Hook: handoff-session-resume ──
-cat > "$HOME/.claude/hooks/handoff-session-resume" << 'HOOKEOF'
-#!/usr/bin/env bash
-# SessionStart hook (matcher compact|resume). Inlines handoff JSON via documented
-# hookSpecificOutput.additionalContext.
-HANDOFF_FILE="$(pwd)/docs/handoff-context.md"
-[[ -f "$HANDOFF_FILE" ]] || exit 0
-SIZE=$(wc -c < "$HANDOFF_FILE" | tr -d ' ')
-AGE_SECS=$(( $(date +%s) - $(stat -f %m "$HANDOFF_FILE" 2>/dev/null || stat -c %Y "$HANDOFF_FILE" 2>/dev/null || echo 0) ))
-AGE_HRS=$(( AGE_SECS / 3600 ))
-if (( SIZE > 9000 )); then
-  CONTEXT=$(printf 'Prior session handoff exists: %s (%sB, %sh old). File too large to inline. Read it with the Read tool. Treat constraints_to_preserve as hard rules. Execute next_steps[0] first. Delete the file after resuming.' "$HANDOFF_FILE" "$SIZE" "$AGE_HRS")
-else
-  JSON_CONTENT=$(cat "$HANDOFF_FILE")
-  CONTEXT=$(printf 'Prior session handoff (auto-generated on compact, age %sh). Do NOT re-explore the codebase. Treat constraints_to_preserve as hard rules. If user request matches next_steps, execute next_steps[0] first. Delete docs/handoff-context.md after resuming.\n\n%s' "$AGE_HRS" "$JSON_CONTENT")
-fi
-jq -n --arg ctx "$CONTEXT" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$ctx}}'
-exit 0
-HOOKEOF
-
-# ── Slash command: /handoff (manual trigger) ──
-mkdir -p "$HOME/.claude/commands"
-cat > "$HOME/.claude/commands/handoff.md" << 'CMDEOF'
----
-description: Save current session state as strict JSON to docs/handoff-context.md for the next session to resume from.
----
-
-# Handoff
-
-Write current session state to `docs/handoff-context.md` as strict JSON. No preamble, no prose, no fences — pure JSON.
-
-## Procedure
-
-1. `docs/` missing? create (`mkdir -p docs` via Bash).
-2. Synthesize state from this convo. Don't re-explore — use ctx.
-3. Write `docs/handoff-context.md` via Write tool. Must parse as valid JSON.
-4. Confirm ONE line: `Handoff saved: docs/handoff-context.md`.
-
-## Schema
-
-```json
-{
-  "session_started": "ISO8601 best estimate",
-  "task": "one sentence — what the user asked for",
-  "completed_tasks": ["one line each, concrete things finished this session"],
-  "current_state": "where things stand right now — in-flight work, files modified, what works, what's broken",
-  "constraints_to_preserve": ["user rules verbatim", "ruled-out approaches + why", "tech constraints"],
-  "files_touched": [{"path": "absolute path", "status": "created|modified|deleted", "summary": "one line"}],
-  "issues_discovered": ["bugs/gotchas + how we worked around them"],
-  "open_questions": ["unresolved decisions"],
-  "next_steps": ["ordered, specific. first item = first action"],
-  "resume_prompt": "one paragraph the user can paste into a fresh session to resume"
-}
-```
-
-## Rules
-
-- Verbatim constraints: never paraphrase user rules.
-- Concrete, not vague.
-- Ordered next_steps: array order = execution order.
-- Pure JSON: file must parse. No headings, no fences, no trailing prose.
-- Overwrite: always overwrite. One handoff per project.
-CMDEOF
-
-# Make all hooks executable
-chmod +x "$HOME/.claude/hooks/"*
-
-# ── 6. Create statusline script ──
-echo "→ Creating statusline..."
-cat > "$HOME/.claude/statusline-command.sh" << 'STATUSEOF'
-#!/usr/bin/env bash
-input=$(cat)
-RESET='\033[0m'; BOLD='\033[1m'
-CYAN='\033[96m'; GREEN='\033[92m'; YELLOW='\033[93m'
-ORANGE='\033[38;5;208m'; RED='\033[91m'; BLUE='\033[94m'
-MAGENTA='\033[95m'; GRAY='\033[90m'; WHITE='\033[97m'
-SEP="${GRAY} │ ${RESET}"
-user=$(whoami)
-dir=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // ""')
-dir_short=$(echo "$dir" | sed "s|$HOME|~|")
-raw_model=$(echo "$input" | jq -r '.model.display_name // ""')
-model=""
-if [ -n "$raw_model" ]; then
-  prefix=$(echo "$raw_model" | grep -ioE 'Haiku|Sonnet|Opus' | head -1 | cut -c1 | tr '[:upper:]' '[:lower:]')
-  version=$(echo "$raw_model" | grep -oE '[0-9]+\.[0-9]+' | tail -1)
-  [ -n "$prefix" ] && [ -n "$version" ] && model="${prefix}${version}"
-  [ -z "$model" ] && model="$raw_model"
-fi
-git_branch=""
-if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
-  git_branch=$(GIT_OPTIONAL_LOCKS=0 git -C "$dir" symbolic-ref --short HEAD 2>/dev/null \
-               || git -C "$dir" rev-parse --short HEAD 2>/dev/null)
-fi
-used_pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
-five_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
-five_resets=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
-week_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
-now=$(date +%H:%M)
-make_bar() {
-  local pct=$1 width=${2:-10} filled=$(echo "$pct $width" | awk '{printf "%d", ($1/100)*$2+0.5}')
-  local empty=$(( width - filled )) bar=""
-  for (( i=0; i<filled; i++ )); do bar+="█"; done
-  for (( i=0; i<empty; i++ )); do bar+="░"; done
-  printf '%s' "$bar"
-}
-pct_color() {
-  if (( $(echo "$1 < 50" | bc -l) )); then printf '%s' "$GREEN"
-  elif (( $(echo "$1 < 75" | bc -l) )); then printf '%s' "$YELLOW"
-  elif (( $(echo "$1 < 90" | bc -l) )); then printf '%s' "$ORANGE"
-  else printf '%s' "$RED"; fi
-}
-out="${BOLD}${CYAN}${user}${RESET}${GRAY} in ${RESET}${WHITE}${dir_short}${RESET}"
-[ -n "$git_branch" ] && out+="${GRAY} on ${RESET}${MAGENTA} ${git_branch}${RESET}"
-[ -n "$model" ] && out+="${SEP}${BLUE}⬡ ${model}${RESET}"
-if [ -n "$used_pct" ]; then
-  pct_int=$(printf '%.0f' "$used_pct")
-  out+="${SEP}${GRAY}ctx $(pct_color "$used_pct")$(make_bar "$pct_int" 8) ${pct_int}%${RESET}"
-fi
-if [ -n "$five_pct" ]; then
-  pct_int=$(printf '%.0f' "$five_pct")
-  reset_str=""
-  if [ -n "$five_resets" ]; then
-    reset_time=$(date -r "$five_resets" +%H:%M 2>/dev/null || date -d "@$five_resets" +%H:%M 2>/dev/null)
-    [ -n "$reset_time" ] && reset_str=" ${GRAY}↺${reset_time}${RESET}"
+# ── Helpers for safe install over an existing setup ──
+# cp_with_backup: if target file exists AND differs from source, rename target
+# to <name>.bak.<ts> before overwrite. No-op when target is missing or already
+# identical. Surfaces user customizations as backups instead of silently nuking.
+cp_with_backup() {
+  local src="$1"; local dst="$2"
+  if [[ -f "$dst" ]] && ! cmp -s "$src" "$dst"; then
+    cp "$dst" "$dst.bak.$(date +%s).$$"
   fi
-  out+="${SEP}${GRAY}5h $(pct_color "$five_pct")$(make_bar "$pct_int" 8) ${pct_int}%${reset_str}${RESET}"
-fi
-if [ -n "$week_pct" ]; then
-  pct_int=$(printf '%.0f' "$week_pct")
-  out+="${SEP}${GRAY}7d $(pct_color "$week_pct")$(make_bar "$pct_int" 8) ${pct_int}%${RESET}"
-fi
-out+="${SEP}${BOLD}${WHITE}${now}${RESET}"
-printf '%b' "$out"
-STATUSEOF
-
-# ── 7. Write settings.json ──
-echo "→ Configuring settings.json..."
-# Back up existing settings
-[ -f "$HOME/.claude/settings.json" ] && cp "$HOME/.claude/settings.json" "$HOME/.claude/settings.json.bak.$(date +%s)"
-
-cat > "$HOME/.claude/settings.json" << 'SETTINGSEOF'
-{
-  "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "env": {
-    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
-    "BASH_MAX_OUTPUT_LENGTH": "10000",
-    "MAX_MCP_OUTPUT_TOKENS": "10000",
-    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-4-6",
-    "ENABLE_PROMPT_CACHING_1H": "1"
-  },
-  "permissions": {
-    "defaultMode": "auto"
-  },
-  "model": "claude-opus-4-7[1m]",
-  "effortLevel": "high",
-  "advisorModel": "opus",
-  "skipDangerousModePermissionPrompt": true,
-  "skipAutoPermissionPrompt": true,
-  "statusLine": {
-    "type": "command",
-    "command": "bash ~/.claude/statusline-command.sh"
-  },
-  "enabledPlugins": {
-    "caveman@caveman": true
-  },
-  "extraKnownMarketplaces": {
-    "caveman": {
-      "source": {
-        "source": "github",
-        "repo": "JuliusBrussee/caveman"
-      }
-    }
-  },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "context-mode hook claude-code pretooluse" },
-          { "type": "command", "command": "~/.claude/hooks/bash-ban-raw-tools" }
-        ]
-      },
-      {
-        "matcher": "Grep|Glob|Read|Search",
-        "hooks": [
-          { "type": "command", "command": "~/.claude/hooks/cbm-code-discovery-gate" }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          { "type": "command", "command": "context-mode hook claude-code posttooluse" },
-          { "type": "command", "command": "~/.claude/hooks/cbm-mcp-marker" }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "hooks": [
-          { "type": "command", "command": "context-mode hook claude-code precompact" },
-          { "type": "command", "command": "~/.claude/hooks/handoff-precompact", "timeout": 90 }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          { "type": "command", "command": "context-mode hook claude-code sessionstart" }
-        ]
-      },
-      {
-        "matcher": "compact",
-        "hooks": [
-          { "type": "command", "command": "~/.claude/hooks/handoff-session-resume" },
-          { "type": "command", "command": "~/.claude/hooks/cbm-session-reminder" }
-        ]
-      },
-      {
-        "matcher": "resume",
-        "hooks": [
-          { "type": "command", "command": "~/.claude/hooks/handoff-session-resume" },
-          { "type": "command", "command": "~/.claude/hooks/cbm-session-reminder" }
-        ]
-      },
-      {
-        "matcher": "clear",
-        "hooks": [
-          { "type": "command", "command": "~/.claude/hooks/cbm-session-reminder" }
-        ]
-      }
-    ]
-  }
+  cp "$src" "$dst"
 }
-SETTINGSEOF
 
-# ── 8. Add shell wrapper ──
-echo "→ Adding shell wrapper for headroom..."
+# inject_claude_md: prepend our framework content into ~/.claude/CLAUDE.md
+# wrapped in <!--cct--> ... <!--/cct--> markers. Re-runs replace the block in
+# place — user's content outside the markers is preserved verbatim.
+inject_claude_md() {
+  local target="$HOME/.claude/CLAUDE.md"
+  local source="$REPO_DIR/CLAUDE.md.example"
+  local m_start='<!--cct-->'
+  local m_end='<!--/cct-->'
 
-# Fish
-if [ -f "$HOME/.config/fish/config.fish" ]; then
-  if ! grep -q 'headroom wrap claude' "$HOME/.config/fish/config.fish" 2>/dev/null; then
-    cat >> "$HOME/.config/fish/config.fish" << 'FISHEOF'
+  # Helper: write start marker + source body + always-newline + end marker.
+  # Forces a newline before $m_end so the marker lives on its own line, even
+  # when $source lacks a trailing newline (otherwise re-run awk can't match it).
+  _write_block() {
+    echo "$m_start"
+    cat "$source"
+    # `$(tail -c 1)` strips a trailing \n (command substitution always does),
+    # so an EMPTY captured string means the file ends in \n (no echo needed).
+    # Anything non-empty means the last byte is non-\n (echo to add one).
+    [[ -z "$(tail -c 1 "$source" 2>/dev/null)" ]] || echo
+    echo "$m_end"
+  }
+
+  if [[ ! -f "$target" ]]; then
+    _write_block > "$target"
+    echo "  ✓ CLAUDE.md created (wrapped in <!--cct--> markers for future updates)"
+    return
+  fi
+
+  # Symlink guard: if target is a symlink, refuse to stomp it via `mv` (which
+  # would replace the symlink with a regular file and orphan whatever it
+  # points at — e.g., a dotfiles-repo file). Resolve to the real path first.
+  if [[ -L "$target" ]]; then
+    local resolved
+    resolved="$(readlink -f "$target" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$target")"
+    echo "  ℹ CLAUDE.md is a symlink → $resolved (editing the real file)"
+    target="$resolved"
+  fi
+
+  # Orphaned-marker guard: if start marker exists but end marker does NOT,
+  # awk would silently drop everything after $m_start. Bail loud instead.
+  if grep -qF "$m_start" "$target" && ! grep -qF "$m_end" "$target"; then
+    echo "  ✗ CLAUDE.md has <!--cct--> start marker but no <!--/cct--> end marker."
+    echo "    Refusing to write — fix manually or delete the start marker. Aborting."
+    return 1
+  fi
+
+  # Per-invocation backup suffix (epoch seconds + PID) — survives concurrent runs.
+  local backup_suffix
+  backup_suffix="$(date +%s).$$"
+
+  # Build candidate output to .tmp, only swap (+ backup) if content differs.
+  if grep -qF "$m_start" "$target"; then
+    awk -v ms="$m_start" -v me="$m_end" -v src="$source" '
+      $0 == ms {
+        print
+        while ((getline line < src) > 0) print line
+        close(src)
+        # If src lacked trailing newline, last line was still printed (awk adds \n).
+        # That is fine — print the end marker on its own line next.
+        skip=1; next
+      }
+      $0 == me { print; skip=0; next }
+      !skip { print }
+    ' "$target" > "$target.tmp"
+    if cmp -s "$target" "$target.tmp"; then
+      rm -f "$target.tmp"
+      echo "  ✓ CLAUDE.md <!--cct--> block already up to date"
+    else
+      cp "$target" "$target.bak.$backup_suffix"
+      mv "$target.tmp" "$target"
+      echo "  ✓ CLAUDE.md <!--cct--> block updated (your content outside markers preserved)"
+    fi
+  else
+    { _write_block; echo ""; cat "$target"; } > "$target.tmp"
+    if cmp -s "$target" "$target.tmp"; then
+      rm -f "$target.tmp"
+      echo "  ✓ CLAUDE.md already up to date"
+    else
+      cp "$target" "$target.bak.$backup_suffix"
+      mv "$target.tmp" "$target"
+      echo "  ✓ CLAUDE.md prepended (your existing content kept below <!--cct--> block)"
+    fi
+  fi
+}
+
+# merge_settings_json: deep jq merge. Preserves user model/effortLevel/
+# permissions/custom env by default. Replaces hooks structure (we own it).
+# Unions enabledPlugins + extraKnownMarketplaces, with explicit CLI flags allowed
+# to remove Caveman or force the sonnet/high model profile.
+# Falls back to plain copy if jq fails.
+merge_settings_json() {
+  local target="$HOME/.claude/settings.json"
+  local source="$SETTINGS_SOURCE"
+  local skip_caveman=false
+  [[ "$INSTALL_CAVEMAN" -eq 0 ]] && skip_caveman=true
+
+  if [[ ! -f "$target" ]]; then
+    cp "$source" "$target"
+    echo "  ✓ settings.json created"
+    return
+  fi
+
+  # Symlink guard: resolve before writing so `mv` doesn't destroy the symlink.
+  if [[ -L "$target" ]]; then
+    local resolved
+    resolved="$(readlink -f "$target" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$target")"
+    echo "  ℹ settings.json is a symlink → $resolved (editing the real file)"
+    target="$resolved"
+  fi
+
+  local backup_suffix
+  backup_suffix="$(date +%s).$$"
+
+  if jq -s --argjson skipCaveman "$skip_caveman" --arg modelProfile "$MODEL_PROFILE" '
+    .[0] as $ours | .[1] as $theirs |
+    ($ours * $theirs)
+    | .hooks = $ours.hooks
+    | .env = (($theirs.env // {}) * ($ours.env // {}))
+    | .enabledPlugins = (($theirs.enabledPlugins // {}) * ($ours.enabledPlugins // {}))
+    | .extraKnownMarketplaces = (($theirs.extraKnownMarketplaces // {}) * ($ours.extraKnownMarketplaces // {}))
+    | .model //= $ours.model
+    | .effortLevel //= $ours.effortLevel
+    | .advisorModel //= $ours.advisorModel
+    | .statusLine //= $ours.statusLine
+    | if $skipCaveman then
+        del(.enabledPlugins["caveman@caveman"]) | del(.extraKnownMarketplaces.caveman)
+      else . end
+    | if $modelProfile == "sonnet" then
+        .model = "sonnet" | .effortLevel = "high"
+      else . end
+  ' "$source" "$target" > "$target.tmp" 2>/dev/null; then
+    # Canonicalize both via jq -S for stable comparison (jq's `*` operator
+    # is not output-byte-stable across runs; sorted-keys form is).
+    if diff -q <(jq -S . "$target" 2>/dev/null) <(jq -S . "$target.tmp" 2>/dev/null) >/dev/null 2>&1; then
+      rm -f "$target.tmp"
+      echo "  ✓ settings.json already up to date"
+    else
+      cp "$target" "$target.bak.$backup_suffix"
+      mv "$target.tmp" "$target"
+      if [[ "$MODEL_PROFILE" == "sonnet" ]]; then
+        echo "  ✓ settings.json merged (sonnet/high forced by --sonnet; permissions preserved)"
+      else
+        echo "  ✓ settings.json merged (your model/effortLevel/permissions preserved if set)"
+      fi
+    fi
+  else
+    rm -f "$target.tmp"
+    cp "$target" "$target.bak.$backup_suffix"
+    echo "  ⚠ settings.json jq merge failed — wrote ours, your file is at $target.bak.<ts>"
+    cp "$source" "$target"
+  fi
+}
+
+# ── 5. Copy hooks, commands, rules, bin (per-file backup on conflict) ──
+echo "→ Copying hooks, commands, rules, bin (backups for changed files)..."
+mkdir -p "$HOME/.claude/hooks" "$HOME/.claude/commands" "$HOME/.claude/rules" "$HOME/.claude/bin"
+for src in "$REPO_DIR/hooks/"*; do
+  [[ -f "$src" ]] && cp_with_backup "$src" "$HOME/.claude/hooks/$(basename "$src")"
+done
+for src in "$REPO_DIR/commands/"*; do
+  [[ -f "$src" ]] && cp_with_backup "$src" "$HOME/.claude/commands/$(basename "$src")"
+done
+for src in "$REPO_DIR/rules/"*.md; do
+  [[ -f "$src" ]] || continue
+  cp_with_backup "$src" "$HOME/.claude/rules/$(basename "$src")"
+done
+if [[ -d "$REPO_DIR/bin" ]]; then
+  for src in "$REPO_DIR/bin/"*; do
+    [[ -f "$src" ]] && cp_with_backup "$src" "$HOME/.claude/bin/$(basename "$src")"
+  done
+fi
+chmod +x "$HOME/.claude/hooks/"* "$HOME/.claude/bin/"*.mjs 2>/dev/null || true
+
+# ── 6. Statusline ──
+echo "→ Installing statusline..."
+cp_with_backup "$REPO_DIR/statusline/statusline-command.sh" "$HOME/.claude/statusline-command.sh"
+chmod +x "$HOME/.claude/statusline-command.sh"
+
+# ── 7. CLAUDE.md (prepend in <!--cct--> markers, idempotent on re-run) ──
+echo "→ Injecting CLAUDE.md framework block..."
+inject_claude_md
+
+# ── 8. settings.json (deep jq merge — preserves user customs) ──
+echo "→ Merging settings.json..."
+merge_settings_json
+
+# ── 9. Shell wrapper for headroom ──
+SHELL_INSTALLED=""
+if [[ "$INSTALL_SHELL_WRAPPER" -eq 1 ]]; then
+  echo "→ Adding shell wrapper for headroom..."
+
+  # Detect user's actual shell (login shell or $SHELL) and install ONLY for that
+  # one. Idempotent: re-running won't re-append. Creates the rc file if missing —
+  # a fresh-macOS user with no ~/.zshrc still gets the wrapper.
+  USER_SHELL="$(basename "${SHELL:-/bin/zsh}")"
+  case "$USER_SHELL" in
+    fish)
+      rc="$HOME/.config/fish/config.fish"
+      mkdir -p "$(dirname "$rc")"; touch "$rc"
+      if ! grep -q 'headroom wrap claude' "$rc" 2>/dev/null; then
+        cat >> "$rc" << 'FISHEOF'
+
+# CBM + Headroom binaries live in ~/.local/bin
+if not contains $HOME/.local/bin $PATH
+    set -gx PATH $HOME/.local/bin $PATH
+end
 
 # Headroom wraps Claude Code for API-layer token compression
 function claude
     command headroom wrap claude $argv
 end
 FISHEOF
-    echo "  ✓ Fish config updated"
-  else
-    echo "  ✓ Fish config already has headroom wrapper"
-  fi
-fi
+      fi
+      SHELL_INSTALLED="fish ($rc)"
+      ;;
+    zsh)
+      rc="$HOME/.zshrc"
+      touch "$rc"
+      if ! grep -q 'headroom wrap claude' "$rc" 2>/dev/null; then
+        cat >> "$rc" << 'ZSHEOF'
 
-# Zsh
-if [ -f "$HOME/.zshrc" ]; then
-  if ! grep -q 'headroom wrap claude' "$HOME/.zshrc" 2>/dev/null; then
-    cat >> "$HOME/.zshrc" << 'ZSHEOF'
+# CBM + Headroom binaries live in ~/.local/bin
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH";; esac
 
 # Headroom wraps Claude Code for API-layer token compression
 claude() { command headroom wrap claude "$@"; }
 ZSHEOF
-    echo "  ✓ Zsh config updated"
-  else
-    echo "  ✓ Zsh config already has headroom wrapper"
-  fi
-fi
+      fi
+      SHELL_INSTALLED="zsh ($rc)"
+      ;;
+    bash)
+      rc="$HOME/.bashrc"
+      touch "$rc"
+      if ! grep -q 'headroom wrap claude' "$rc" 2>/dev/null; then
+        cat >> "$rc" << 'BASHEOF'
 
-# Bash
-if [ -f "$HOME/.bashrc" ]; then
-  if ! grep -q 'headroom wrap claude' "$HOME/.bashrc" 2>/dev/null; then
-    cat >> "$HOME/.bashrc" << 'BASHEOF'
+# CBM + Headroom binaries live in ~/.local/bin
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH";; esac
 
 # Headroom wraps Claude Code for API-layer token compression
 claude() { command headroom wrap claude "$@"; }
 BASHEOF
-    echo "  ✓ Bash config updated"
-  else
-    echo "  ✓ Bash config already has headroom wrapper"
-  fi
+      fi
+      SHELL_INSTALLED="bash ($rc)"
+      ;;
+    *)
+      echo "  ⚠ Unrecognised shell '$USER_SHELL'. Add this to your shell rc manually:"
+      echo "      claude() { command headroom wrap claude \"\$@\"; }"
+      ;;
+  esac
+  [[ -n "$SHELL_INSTALLED" ]] && echo "  ✓ Shell wrapper installed: $SHELL_INSTALLED"
+else
+  echo "→ Skipping shell wrapper for headroom (--no-shell-wrapper)"
+  echo "  Manual launch stays available: headroom wrap claude"
+fi
+
+# ── 10. Validate ──
+echo "→ Validating installation..."
+if "$REPO_DIR/install.sh" --check >/dev/null 2>&1; then
+  echo "  ✓ All hooks, command plugin refs, and bin scripts resolve"
+else
+  echo "  ⚠ ./install.sh --check reported issues — re-run for details"
 fi
 
 echo ""
@@ -463,19 +558,43 @@ echo ""
 echo "What was installed:"
 echo "  ✓ Headroom (API-layer compression, bundles RTK)"
 echo "  ✓ codebase-memory-mcp (knowledge graph for code)"
-echo "  ✓ context-mode (output virtualization)"
-echo "  ✓ Caveman plugin (compressed Claude output)"
-echo "  ✓ 6 enforcement hooks (incl handoff-precompact + handoff-session-resume)"
-echo "  ✓ /handoff slash command"
+echo "  ✓ context-mode plugin (output virtualization)"
+if [[ "$INSTALL_CAVEMAN" -eq 1 ]]; then
+  echo "  ✓ Caveman plugin (compressed Claude output)"
+else
+  echo "  - Caveman plugin skipped (--no-caveman)"
+fi
+echo "  ✓ All enforcement hooks from repo hooks/"
+echo "  ✓ All slash commands from repo commands/"
+echo "  ✓ Private agent definitions left untouched in ~/.claude/agents/"
+echo "  ✓ Stack rules dir created at ~/.claude/rules/ (empty by design — drop your own per rules/README.md)"
+echo "  ✓ bin/ helper scripts (sync-copilot, sync-runner-tools)"
 echo "  ✓ Custom statusline"
-echo "  ✓ Optimized settings.json"
-echo "  ✓ Shell wrappers (fish/zsh/bash)"
+if [[ "$MODEL_PROFILE" == "sonnet" ]]; then
+  echo "  ✓ Optimized settings.json (sonnet/high profile)"
+else
+  echo "  ✓ Optimized settings.json (opus/xhigh power profile)"
+fi
+if [[ -n "$SHELL_INSTALLED" ]]; then
+  echo "  ✓ Shell wrapper: $SHELL_INSTALLED"
+else
+  echo "  - Shell wrapper skipped; run manually with: headroom wrap claude"
+fi
 echo ""
 echo "Next steps:"
 echo "  1. Restart your shell: exec \$SHELL"
-echo "  2. Run 'claude' — it now auto-wraps through Headroom"
+if [[ "$INSTALL_SHELL_WRAPPER" -eq 1 ]]; then
+  echo "  2. Run 'claude' — it now auto-wraps through Headroom"
+else
+  echo "  2. Run 'headroom wrap claude' when you want API-layer compression"
+fi
 echo "  3. In a project, CBM will prompt to index on first use"
-echo "  4. Run '/caveman' to activate compressed output mode"
+if [[ "$INSTALL_CAVEMAN" -eq 1 ]]; then
+  echo "  4. Run '/caveman' to activate compressed output mode"
+else
+  echo "  4. Caveman skipped; re-run './install.sh' without --no-caveman to add it"
+fi
+echo "  5. Re-run './install.sh --check' anytime to validate config"
 echo ""
 echo "Repos:"
 echo "  Headroom:  https://github.com/chopratejas/headroom"

@@ -1,0 +1,16 @@
+# CBM knowledge graph + log
+.codebase/
+
+# Caveman compress backups (human-readable originals next to compressed files)
+*.original.md
+
+# Internal audit notes (not for public)
+REVIEW.md
+
+# Per-session handoff snapshots written by hooks/handoff-stop
+docs/handoff-*.md
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+.claude/memory/

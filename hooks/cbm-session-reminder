@@ -1,5 +1,6 @@
 #!/bin/bash
-# Remind agent to use codebase-memory-mcp tools at session boundaries.
+# SessionStart hook: remind agent to use codebase-memory-mcp tools.
+# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.
 cat << 'REMINDER'
 CRITICAL - Code Discovery Protocol:
 1. ALWAYS use codebase-memory-mcp tools FIRST for ANY code exploration:

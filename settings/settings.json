@@ -1,28 +1,153 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "env": {
-    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
-    "BASH_MAX_OUTPUT_LENGTH": "10000",
-    "MAX_MCP_OUTPUT_TOKENS": "10000",
     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-4-6",
-    "ENABLE_PROMPT_CACHING_1H": "1"
+    "ENABLE_PROMPT_CACHING_1H": "1",
+    "BASH_MAX_OUTPUT_LENGTH": "10000",
+    "MAX_MCP_OUTPUT_TOKENS": "10000",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7[1m]",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-4-6"
   },
   "permissions": {
     "defaultMode": "auto"
   },
-  "model": "claude-opus-4-7[1m]",
-  "effortLevel": "high",
+  "model": "claude-opus-4-7",
+  "effortLevel": "xhigh",
   "advisorModel": "opus",
-  "skipDangerousModePermissionPrompt": true,
-  "skipAutoPermissionPrompt": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "context-mode hook claude-code pretooluse"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/bash-ban-raw-tools"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/flutter-ctx-redirect"
+          },
+          {
+            "type": "command",
+            "command": "rtk hook claude"
+          }
+        ]
+      },
+      {
+        "matcher": "Grep|Glob|Read|Search",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-code-discovery-gate"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "context-mode hook claude-code posttooluse"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-mcp-marker"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/sync-copilot-on-edit"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/sync-runner-tools-on-edit"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "context-mode hook claude-code precompact"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "context-mode hook claude-code sessionstart"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/memory-repo-symlink"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-session-reminder"
+          }
+        ]
+      },
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-session-reminder"
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-session-reminder"
+          }
+        ]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-session-reminder"
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/cbm-session-reminder"
+          }
+        ]
+      }
+    ]
+  },
   "statusLine": {
     "type": "command",
     "command": "bash ~/.claude/statusline-command.sh"
   },
   "enabledPlugins": {
-    "caveman@caveman": true
+    "caveman@caveman": true,
+    "context-mode@context-mode": true
   },
   "extraKnownMarketplaces": {
     "caveman": {
@@ -30,66 +155,19 @@
         "source": "github",
         "repo": "JuliusBrussee/caveman"
       }
+    },
+    "context-mode": {
+      "source": {
+        "source": "github",
+        "repo": "mksglu/context-mode"
+      }
     }
   },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "context-mode hook claude-code pretooluse" },
-          { "type": "command", "command": "~/.claude/hooks/bash-ban-raw-tools" }
-        ]
-      },
-      {
-        "matcher": "Grep|Glob|Read|Search",
-        "hooks": [
-          { "type": "command", "command": "~/.claude/hooks/cbm-code-discovery-gate" }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          { "type": "command", "command": "context-mode hook claude-code posttooluse" },
-          { "type": "command", "command": "~/.claude/hooks/cbm-mcp-marker" }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "hooks": [
-          { "type": "command", "command": "context-mode hook claude-code precompact" },
-          { "type": "command", "command": "~/.claude/hooks/handoff-precompact", "timeout": 90 }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "hooks": [
-          { "type": "command", "command": "context-mode hook claude-code sessionstart" }
-        ]
-      },
-      {
-        "matcher": "compact",
-        "hooks": [
-          { "type": "command", "command": "~/.claude/hooks/handoff-session-resume" },
-          { "type": "command", "command": "~/.claude/hooks/cbm-session-reminder" }
-        ]
-      },
-      {
-        "matcher": "resume",
-        "hooks": [
-          { "type": "command", "command": "~/.claude/hooks/handoff-session-resume" },
-          { "type": "command", "command": "~/.claude/hooks/cbm-session-reminder" }
-        ]
-      },
-      {
-        "matcher": "clear",
-        "hooks": [
-          { "type": "command", "command": "~/.claude/hooks/cbm-session-reminder" }
-        ]
-      }
-    ]
-  }
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "agentPushNotifEnabled": true,
+  "skipDangerousModePermissionPrompt": true,
+  "skipAutoPermissionPrompt": true
 }
