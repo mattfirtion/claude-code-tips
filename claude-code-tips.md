@@ -164,7 +164,7 @@ https://gist.github.com/sgaabdu4/67aa0360409be437dbd6bfff85d7cd76
 
 ### Setup: one shell function
 
-[`install.sh`](https://github.com/sgaabdu4/claude-code-tips/blob/main/install.sh) injects a `claude` shell function into your `.bashrc`/`.zshrc`/`.config/fish/config.fish` that wraps the binary with `headroom wrap claude "$@"`. Starts a local proxy, sets `ANTHROPIC_BASE_URL`, launches Claude. `--resume`, `-p "query"`, all args pass through. RTK ships inside the Headroom binary and auto-registers as the inner CLI proxy — no separate setup.
+[`install.sh`](https://github.com/sgaabdu4/claude-code-tips/blob/main/install.sh) injects a `claude` shell function into your `.bashrc`/`.zshrc`/`.config/fish/config.fish` that wraps the binary with `headroom wrap claude -- "$@"` (`-- $argv` in Fish). The separator matters because Claude's `-p` print-mode flag otherwise collides with Headroom's `-p/--port` option. Starts a local proxy, sets `ANTHROPIC_BASE_URL`, launches Claude. `--resume`, `-p "query"`, all args pass through. RTK ships inside the Headroom binary and auto-registers as the inner CLI proxy — no separate setup.
 
 ---
 
@@ -335,7 +335,7 @@ Escape hatches:
 ./install.sh --check              # validate every hook/command/bin reference
 ```
 
-Use `--no-shell-wrapper` if you want to inspect the stack before making `claude` auto-wrap through Headroom. Tune `model` / `effortLevel` / `advisorModel` after install if you have a different account profile.
+Use `--no-shell-wrapper` if you want to inspect the stack before making `claude` auto-wrap through Headroom. Manual launch is `headroom wrap claude -- <claude args>`. Tune `model` / `effortLevel` / `advisorModel` after install if you have a different account profile.
 
 ## Bonus: The workflow this unlocks
 

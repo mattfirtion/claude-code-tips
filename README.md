@@ -28,7 +28,7 @@ Default stays maximal. These flags narrow blast radius without editing the scrip
 ./install.sh --check              # validate repo wiring only
 ```
 
-`--no-shell-wrapper` is the safer alternative to skipping Headroom entirely: this stack relies on Headroom to provide RTK, so the flag keeps the binary installed while making API-layer compression an explicit `headroom wrap claude` launch choice.
+`--no-shell-wrapper` is the safer alternative to skipping Headroom entirely: this stack relies on Headroom to provide RTK, so the flag keeps the binary installed while making API-layer compression an explicit `headroom wrap claude -- <claude args>` launch choice.
 
 ### Existing setup? Don't worry
 

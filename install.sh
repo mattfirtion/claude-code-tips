@@ -487,6 +487,9 @@ if [[ "$INSTALL_SHELL_WRAPPER" -eq 1 ]]; then
     fish)
       rc="$HOME/.config/fish/config.fish"
       mkdir -p "$(dirname "$rc")"; touch "$rc"
+      if grep -q 'command headroom wrap claude \$argv' "$rc" 2>/dev/null; then
+        perl -0pi -e 's/command headroom wrap claude \$argv/command headroom wrap claude -- \$argv/g' "$rc"
+      fi
       if ! grep -q 'headroom wrap claude' "$rc" 2>/dev/null; then
         cat >> "$rc" << 'FISHEOF'
 
@@ -497,7 +500,7 @@ end
 
 # Headroom wraps Claude Code for API-layer token compression
 function claude
-    command headroom wrap claude $argv
+    command headroom wrap claude -- $argv
 end
 FISHEOF
       fi
@@ -506,6 +509,9 @@ FISHEOF
     zsh)
       rc="$HOME/.zshrc"
       touch "$rc"
+      if grep -q 'command headroom wrap claude "\$@"' "$rc" 2>/dev/null; then
+        perl -0pi -e 's/command headroom wrap claude "\$@"/command headroom wrap claude -- "\$@"/g' "$rc"
+      fi
       if ! grep -q 'headroom wrap claude' "$rc" 2>/dev/null; then
         cat >> "$rc" << 'ZSHEOF'
 
@@ -513,7 +519,7 @@ FISHEOF
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH";; esac
 
 # Headroom wraps Claude Code for API-layer token compression
-claude() { command headroom wrap claude "$@"; }
+claude() { command headroom wrap claude -- "$@"; }
 ZSHEOF
       fi
       SHELL_INSTALLED="zsh ($rc)"
@@ -521,6 +527,9 @@ ZSHEOF
     bash)
       rc="$HOME/.bashrc"
       touch "$rc"
+      if grep -q 'command headroom wrap claude "\$@"' "$rc" 2>/dev/null; then
+        perl -0pi -e 's/command headroom wrap claude "\$@"/command headroom wrap claude -- "\$@"/g' "$rc"
+      fi
       if ! grep -q 'headroom wrap claude' "$rc" 2>/dev/null; then
         cat >> "$rc" << 'BASHEOF'
 
@@ -528,20 +537,20 @@ ZSHEOF
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH";; esac
 
 # Headroom wraps Claude Code for API-layer token compression
-claude() { command headroom wrap claude "$@"; }
+claude() { command headroom wrap claude -- "$@"; }
 BASHEOF
       fi
       SHELL_INSTALLED="bash ($rc)"
       ;;
     *)
       echo "  ⚠ Unrecognised shell '$USER_SHELL'. Add this to your shell rc manually:"
-      echo "      claude() { command headroom wrap claude \"\$@\"; }"
+      echo "      claude() { command headroom wrap claude -- \"\$@\"; }"
       ;;
   esac
   [[ -n "$SHELL_INSTALLED" ]] && echo "  ✓ Shell wrapper installed: $SHELL_INSTALLED"
 else
   echo "→ Skipping shell wrapper for headroom (--no-shell-wrapper)"
-  echo "  Manual launch stays available: headroom wrap claude"
+  echo "  Manual launch stays available: headroom wrap claude -- <claude args>"
 fi
 
 # ── 10. Validate ──
@@ -578,7 +587,7 @@ fi
 if [[ -n "$SHELL_INSTALLED" ]]; then
   echo "  ✓ Shell wrapper: $SHELL_INSTALLED"
 else
-  echo "  - Shell wrapper skipped; run manually with: headroom wrap claude"
+  echo "  - Shell wrapper skipped; run manually with: headroom wrap claude -- <claude args>"
 fi
 echo ""
 echo "Next steps:"
@@ -586,7 +595,7 @@ echo "  1. Restart your shell: exec \$SHELL"
 if [[ "$INSTALL_SHELL_WRAPPER" -eq 1 ]]; then
   echo "  2. Run 'claude' — it now auto-wraps through Headroom"
 else
-  echo "  2. Run 'headroom wrap claude' when you want API-layer compression"
+  echo "  2. Run 'headroom wrap claude -- <claude args>' when you want API-layer compression"
 fi
 echo "  3. In a project, CBM will prompt to index on first use"
 if [[ "$INSTALL_CAVEMAN" -eq 1 ]]; then
