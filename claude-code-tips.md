@@ -1,6 +1,6 @@
 # How I Cut Claude Code Token Usage by 90%+ With 5 Tools, Custom Hooks, and Enforcement
 
-> **TL;DR:** I stack 5 layers to cut Claude Code token usage by 90%+: (1) **Codebase Memory MCP**: knowledge graph replaces file reads for code exploration (99% savings), (2) **context-mode**: sandboxes large outputs and returns only summaries (98% savings), (3) **RTK**: compresses CLI output in-place (60-90% savings), (4) **Headroom**: API proxy that compresses the entire prompt before it leaves your machine (47-92% savings), (5) **Caveman**: makes Claude's own responses terse (50-75% savings). Custom hooks *enforce* these tools so Claude can't bypass them. Sessions go from ~30 min to 3+ hours. One-click install script at the bottom.
+> **TL;DR:** Five layers, each ripping tokens out at a different point in the pipeline. (1) **Codebase Memory MCP** trades file reads for a knowledge graph (99% off). (2) **context-mode** sandboxes large outputs and hands back a summary (98% off). (3) **RTK** compresses CLI output in place (60-90% off). (4) **Headroom** is an API proxy that compresses everything before it leaves your machine (47-92% off). (5) **Caveman** makes Claude itself talk less (50-75% off). Hooks *enforce* the stack so Claude can't slip back to the lazy path. My sessions stretched from 30 minutes to 3+ hours. One-click installer at the bottom.
 
 ### Cheat sheet: every tip in 60 seconds
 
@@ -9,7 +9,7 @@
 - **CBM** (graph) for code discovery · **context-mode** for large outputs · **RTK** for shell · **Headroom** for API payload · **Caveman** for Claude's own output
 - **Two hooks do the heavy lifting:** `bash-ban-raw-tools` (blocks `cat`/`grep`/`find`/…) + `cbm-code-discovery-gate` (blocks `Read`/`Grep` on source until CBM is called)
 - **`/caveman:compress`** your CLAUDE.md: multiplicative win, loads every session
-- **Per-stack rule files** in `~/.claude/rules/<stack>.md`: skill gate + numbered self-check. Repo ships an empty `rules/` with [`README.md`](https://github.com/sgaabdu4/claude-code-tips/blob/main/rules/README.md) — drop your own; mine are project-specific and listed below as examples
+- **Per-stack rule files** in `~/.claude/rules/<stack>.md`: skill gate + numbered self-check. Repo ships an empty `rules/` with [`README.md`](https://github.com/sgaabdu4/claude-code-tips/blob/main/rules/README.md). Drop in your own. Mine stay private since they only match my stacks; examples are further down.
 - **CLI over MCP** for Tavily/Appwrite: same power, way less context
 - **Only 2 MCP servers:** `codebase-memory-mcp` + `context-mode`. Everything else is CLI or hooks
 - **PostToolUse reject scanners**: ESLint custom rule · node regex scanner · Dart analyzer plugin · Husky + lint-staged
@@ -73,7 +73,7 @@ Three zero-effort moves that save tokens today:
 
 - **`/clear` aggressively.** Short focused sessions beat long ones. The longer the session, the more Claude re-reads its own trail. ([Claude Code slash commands](https://code.claude.com/docs/en/claude-code/slash-commands))
 - **Disable unused MCP servers per session.** `claude mcp list` → drop anything this task doesn't need. Unused servers burn context silently via tool descriptions. ([`claude mcp` reference](https://code.claude.com/docs/en/claude-code/cli-reference#mcp))
-- **Prefer Mermaid over prose for architecture.** A 6-line Mermaid diagram carries the same shape as 3 paragraphs at a fraction of the tokens. and Claude parses it natively.
+- **Prefer Mermaid over prose for architecture.** A 6-line Mermaid diagram carries the same shape as 3 paragraphs at a fraction of the tokens, and Claude parses it natively.
 
 ---
 
@@ -89,16 +89,16 @@ Three zero-effort moves that save tokens today:
 
 I don't just *tell* Claude to use CBM first. I *block* it from falling back to file reads without using CBM.
 
-**The gate pattern:** Two hooks work together. A PreToolUse hook fires on the FIRST `Grep`/`Glob`/`Read`/`Search` per session and blocks it. A PostToolUse hook touches a marker file whenever a `codebase-memory-mcp` tool runs. Once the marker exists, the gate allows everything for the rest of the session — Claude has been nudged to use CBM at least once, that's enough.
+**The gate pattern:** Two hooks work in tandem. A PreToolUse hook fires on the FIRST `Grep`/`Glob`/`Read`/`Search` of the session and blocks it. A PostToolUse hook touches a marker file the moment any `codebase-memory-mcp` tool runs. Once that marker exists, the gate steps aside for the rest of the session. One CBM call is all it takes.
 
-**`~/.claude/hooks/cbm-code-discovery-gate`** (PreToolUse): 16-line state machine using two PPID-scoped `/tmp` marker files — a "blocked once" flag (`cbm-code-discovery-gate-$PPID`, written by this hook) and a "CBM was used" flag (`cbm-mcp-used-$PPID`, written by the companion `cbm-mcp-marker` hook). First `Grep`/`Glob`/`Read`/`Search` call exits 2 with a CBM nudge message and creates the "blocked once" flag. Every call after that exits 0 — either because CBM has since run (the "CBM was used" flag exists), or because Claude already saw the block once (the "blocked once" flag exists) and the gate self-disarms so the rest of the session flows. Full source: [`hooks/cbm-code-discovery-gate`](https://github.com/sgaabdu4/claude-code-tips/blob/main/hooks/cbm-code-discovery-gate).
+**`~/.claude/hooks/cbm-code-discovery-gate`** (PreToolUse): a 16-line state machine driven by two PPID-scoped `/tmp` flags. One is the "blocked once" flag (`cbm-code-discovery-gate-$PPID`, written by this hook). The other is the "CBM was used" flag (`cbm-mcp-used-$PPID`, written by the companion `cbm-mcp-marker` hook). First `Grep`/`Glob`/`Read`/`Search` call exits 2 with a CBM nudge and drops the "blocked once" flag. Every call after that exits 0, either because CBM has since run (the "CBM was used" flag exists) or because Claude already saw the block once (the "blocked once" flag exists) and the gate self-disarms so the rest of the session flows. Full source: [`hooks/cbm-code-discovery-gate`](https://github.com/sgaabdu4/claude-code-tips/blob/main/hooks/cbm-code-discovery-gate).
 
 Two companion hooks ([`hooks/`](https://github.com/sgaabdu4/claude-code-tips/tree/main/hooks)):
 
 - **`cbm-mcp-marker`** (PostToolUse): touches `/tmp/cbm-mcp-used-$PPID` when any `mcp__codebase-memory-mcp__*` tool fires. The gate sees it and lets every subsequent file-search through.
 - **`cbm-session-reminder`** (SessionStart, matches `startup`/`resume`/`clear`/`compact`): re-injects the CBM protocol so Claude doesn't forget mid-session.
 
-**Key insight:** Claude *will* fall back to `Read`/`Grep` if you only *suggest* CBM. Suggestion isn't enforcement; blocking is.
+Claude *will* drift back to `Read`/`Grep` the moment you only *suggest* CBM. Suggestion isn't enforcement. Blocking is.
 
 ---
 
@@ -164,7 +164,7 @@ https://gist.github.com/sgaabdu4/67aa0360409be437dbd6bfff85d7cd76
 
 ### Setup: one shell function
 
-[`install.sh`](https://github.com/sgaabdu4/claude-code-tips/blob/main/install.sh) injects a `claude` shell function into your `.bashrc`/`.zshrc`/`.config/fish/config.fish` that wraps the binary with `headroom wrap claude -- "$@"` (`-- $argv` in Fish). The separator matters because Claude's `-p` print-mode flag otherwise collides with Headroom's `-p/--port` option. Starts a local proxy, sets `ANTHROPIC_BASE_URL`, launches Claude. `--resume`, `-p "query"`, all args pass through. RTK ships inside the Headroom binary and auto-registers as the inner CLI proxy — no separate setup.
+[`install.sh`](https://github.com/sgaabdu4/claude-code-tips/blob/main/install.sh) drops a `claude` shell function into your `.bashrc`/`.zshrc`/`.config/fish/config.fish` that wraps the binary with `headroom wrap claude -- "$@"` (`-- $argv` in Fish). The separator matters: Claude's `-p` print-mode flag otherwise collides with Headroom's `-p/--port` option. The wrapper boots a local proxy, sets `ANTHROPIC_BASE_URL`, and launches Claude. `--resume`, `-p "query"`, all args pass through. RTK rides inside the Headroom binary and auto-registers as the inner CLI proxy. No separate setup.
 
 ---
 
@@ -172,9 +172,9 @@ https://gist.github.com/sgaabdu4/67aa0360409be437dbd6bfff85d7cd76
 
 **Repo:** [github.com/JuliusBrussee/caveman](https://github.com/JuliusBrussee/caveman)
 
-This one is often overlooked: **Claude's own verbose responses count against your context window**. Every "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by..." is wasted tokens.
+Most people forget this one. **Claude's own verbose responses count against your context window.** Every "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by..." is tokens you paid for and got nothing back.
 
-Caveman is a Claude Code plugin that makes Claude respond in compressed style. Drops articles, filler words, hedging, pleasantries. All technical substance stays, only fluff dies.
+Caveman is a Claude Code plugin that flips Claude into a compressed register. Articles, filler, hedging, pleasantries: gone. Technical substance survives untouched.
 
 **Before:**
 > "Sure! I'd be happy to help you with that. The issue you're experiencing is likely caused by a race condition in the authentication middleware where the token expiry check uses a strict less-than comparison instead of less-than-or-equal."
@@ -182,7 +182,7 @@ Caveman is a Claude Code plugin that makes Claude respond in compressed style. D
 **After:**
 > "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
 
-### It's more than just a speaking style
+### Not just a speaking style
 
 Caveman ships with automatic hooks and sub-skills:
 
@@ -195,7 +195,7 @@ Caveman ships with automatic hooks and sub-skills:
 
 ### Installation
 
-Caveman installs via the Claude Code third-party plugin marketplace. enable in `settings.json` under `enabledPlugins` + `extraKnownMarketplaces` pointing at `JuliusBrussee/caveman`. Hooks auto-activate on `SessionStart` + `UserPromptSubmit`. Full snippet in the [companion `settings.json`](https://github.com/sgaabdu4/claude-code-tips/blob/main/settings/settings.json).
+Caveman installs through the Claude Code third-party plugin marketplace. Enable it in `settings.json` under `enabledPlugins` and add an `extraKnownMarketplaces` entry pointing at `JuliusBrussee/caveman`. Hooks auto-activate on `SessionStart` and `UserPromptSubmit`. Full snippet in the [companion `settings.json`](https://github.com/sgaabdu4/claude-code-tips/blob/main/settings/settings.json).
 
 ---
 
@@ -211,26 +211,26 @@ Fix: a Bash PreToolUse hook that blocks the raw commands (`cat`/`head`/`tail`/`f
 
 Full file: [`settings/settings.json`](https://github.com/sgaabdu4/claude-code-tips/blob/main/settings/settings.json). Top-level shape:
 
-- **`env`** — 8 framework keys (covered below).
-- **`permissions.defaultMode: auto`** — fewer permission prompts mid-flow.
-- **`model: claude-opus-4-7`** + **`effortLevel: xhigh`** + **`advisorModel: opus`** — primary model + reasoning budget + advisor escalation target.
-- **`statusLine`** — points at `statusline-command.sh`.
-- **`enabledPlugins`** — `caveman@caveman`, `context-mode@context-mode` (each with a matching `extraKnownMarketplaces` entry).
-- **`hooks`** — one entry per lifecycle event:
-    - `PreToolUse` — Bash → `context-mode` + `bash-ban-raw-tools` + `flutter-ctx-redirect` + `rtk`; `Grep|Glob|Read|Search` → `cbm-code-discovery-gate`.
-    - `PostToolUse` — `context-mode` + `cbm-mcp-marker`; `Edit|Write|MultiEdit` → sync hooks.
-    - `PreCompact` — `context-mode`.
-    - `SessionStart` — matcherless `context-mode` + `memory-repo-symlink` + `cbm-session-reminder`, plus `startup`/`resume`/`clear`/`compact` matchers each running `cbm-session-reminder`.
+- **`env`**: 8 framework keys (covered below).
+- **`permissions.defaultMode: auto`**: fewer permission prompts mid-flow.
+- **`model: claude-opus-4-7`** + **`effortLevel: xhigh`** + **`advisorModel: opus`**: primary model, reasoning budget, advisor escalation target.
+- **`statusLine`**: points at `statusline-command.sh`.
+- **`enabledPlugins`**: `caveman@caveman`, `context-mode@context-mode` (each with a matching `extraKnownMarketplaces` entry).
+- **`hooks`**: one entry per lifecycle event.
+    - `PreToolUse`: Bash routes through `context-mode` + `bash-ban-raw-tools` + `flutter-ctx-redirect` + `rtk`; `Grep|Glob|Read|Search` routes through `cbm-code-discovery-gate`.
+    - `PostToolUse`: `context-mode` + `cbm-mcp-marker`; `Edit|Write|MultiEdit` fires the sync hooks.
+    - `PreCompact`: `context-mode`.
+    - `SessionStart`: matcherless `context-mode` + `memory-repo-symlink` + `cbm-session-reminder`, plus `startup`/`resume`/`clear`/`compact` matchers each running `cbm-session-reminder`.
 
 ### What each env var does
 
-Headliners: `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=50` fires compaction at 50% of context window (instead of the default ~95%), keeping long sessions from thrashing at the ceiling. `CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6` pins delegated subagents to Sonnet 4.6 (60% cheaper than Opus, plenty smart for research/refactor/audit). `ENABLE_PROMPT_CACHING_1H=1` extends prompt cache TTL from 5 minutes to 1 hour (big cost saver on long sessions). Full table:
+Headliners. `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=50` fires compaction at 50% of the context window instead of the default 95%, keeping long sessions off the ceiling. `CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6` pins delegated subagents to Sonnet 4.6 (60% cheaper than Opus, plenty smart for research, refactor, audit). `ENABLE_PROMPT_CACHING_1H=1` stretches the prompt cache TTL from 5 minutes to 1 hour, a serious cost saver on long sessions. Full table:
 
 https://gist.github.com/sgaabdu4/f352f61e23f41f331c7d5a5985bc9604
 
 ### Other settings explained
 
-`effortLevel: xhigh` keeps Opus 4.7 reasoning unlocked (also the 4.7 default; drop to `medium` for cost-sensitive sessions). `advisorModel: opus` routes the built-in advisor tool to the strongest model for second opinions. Subagents inherit `claude-sonnet-4-6` from the env var by default — override per-agent with `model: claude-opus-4-7` in `~/.claude/agents/<name>.md` frontmatter for high-stakes work (refactor, multi-file impact, audit). Full table:
+`effortLevel: xhigh` keeps Opus 4.7 reasoning unlocked (it's also the 4.7 default; drop to `medium` when you're cost-sensitive). `advisorModel: opus` routes the built-in advisor tool to the strongest model for second opinions. Subagents inherit `claude-sonnet-4-6` from the env var by default. Override per-agent with `model: claude-opus-4-7` in `~/.claude/agents/<name>.md` frontmatter when the stakes are high (refactor, multi-file impact, audit). Full table:
 
 https://gist.github.com/sgaabdu4/9ef5dd71813217c695ee5f5944c49680
 
@@ -238,31 +238,31 @@ https://gist.github.com/sgaabdu4/9ef5dd71813217c695ee5f5944c49680
 
 ## The CLAUDE.md That Makes It Work
 
-Your CLAUDE.md is instructions for *in-session* behavior. Don't document external tools (Headroom, RTK) here. they operate outside the session and Claude can't see them. Only instruct on tools Claude actively calls.
+Your CLAUDE.md is instructions for *in-session* behavior. Don't document external tools (Headroom, RTK) here. They operate outside the session and Claude can't see them. Only instruct on the tools Claude actively calls.
 
 Full file: [`CLAUDE.md.example`](https://github.com/sgaabdu4/claude-code-tips/blob/main/CLAUDE.md.example). Sections it covers:
 
-- **Principles** — DRY/KISS/YAGNI/SSOT, read code first, fail→change approach, ask before destructive.
-- **Implementation Flow** — 10-step ordered routine Claude must run for every implementation task (Index → Skill gate → Clarify → Explore via CBM → Plan → Delegate? → Ripple → TDD → Verify → Advisor). Skip a step → STOP, restart from skipped.
-- **Skill gates** — pattern for routing stack files at the per-stack skill (stack rule loads first, no skip).
-- **Ripple check** — any add/change/remove must `trace_path` ALL call sites; never trust "only used here".
-- **TDD** — red/green/refactor with explicit edge-case list (empty/null/boundary/concurrency/tz/unicode/overflow/permission/network/partial).
-- **Tools Quickref** — single-table mapping of intent → tool (`search_graph` for find-def, `trace_path` for flow, `ctx_execute` for run, `ctx_fetch_and_index` for URLs, etc.).
-- **Banned Bash** — `cat`/`head`/`tail`/`grep`/`find` are blocked; use Read/Grep/Glob tools instead.
-- **Subagents** — when to delegate (MANDATORY for research, refactor >2 files, audit, multi-file impact), parallel cap 3, frontmatter fields (`permissionMode: plan` for read-only audit agents, `isolation: worktree`, `model: claude-opus-4-7`, `effort: xhigh`).
-- **Reply style** — min tokens, answer first, no filler/preamble/recap.
+- **Principles**: DRY/KISS/YAGNI/SSOT, read code first, fail→change approach, ask before destructive.
+- **Implementation Flow**: 10-step ordered routine Claude must run for every implementation task (Index → Skill gate → Clarify → Explore via CBM → Plan → Delegate? → Ripple → TDD → Verify → Advisor). Skip a step, STOP, restart from skipped.
+- **Skill gates**: pattern for routing stack files at the per-stack skill (stack rule loads first, no skip).
+- **Ripple check**: any add/change/remove must `trace_path` ALL call sites. Never trust "only used here".
+- **TDD**: red/green/refactor with explicit edge-case list (empty/null/boundary/concurrency/tz/unicode/overflow/permission/network/partial).
+- **Tools Quickref**: single-table mapping of intent to tool (`search_graph` for find-def, `trace_path` for flow, `ctx_execute` for run, `ctx_fetch_and_index` for URLs, etc.).
+- **Banned Bash**: `cat`/`head`/`tail`/`grep`/`find` are blocked. Use Read/Grep/Glob tools instead.
+- **Subagents**: when to delegate (MANDATORY for research, refactor >2 files, audit, multi-file impact), parallel cap 3, frontmatter fields (`permissionMode: plan` for read-only audit agents, `isolation: worktree`, `model: claude-opus-4-7`, `effort: xhigh`).
+- **Reply style**: min tokens, answer first, no filler, no preamble, no recap.
 
 ### Per-language rule files
 
 I also use `.claude/rules/` for stack-specific enforcement. Loaded via `@` import from `CLAUDE.md`. One file per stack. Skill to invoke first, numbered self-check of the handful of footguns Claude repeatedly trips on. Build the list from actual failures you've seen.
 
-**The repo ships `rules/` empty** — only [`rules/README.md`](https://github.com/sgaabdu4/claude-code-tips/blob/main/rules/README.md), a template. Listing my flutter/react/appwrite rules in the install would either pollute your context with stuff you don't ship, or imply they apply when they don't. The three I run (shown below as article examples, not shipped as files):
+**The repo ships `rules/` empty.** Just [`rules/README.md`](https://github.com/sgaabdu4/claude-code-tips/blob/main/rules/README.md) as a template. Listing my flutter/react/appwrite rules in the install would either pollute your context with stuff you don't ship, or imply they apply when they don't. The three I run (shown below as article examples, not shipped as files):
 
 #### Flutter
 - Scope: `**/*.dart`, `**/pubspec.yaml`, `**/analysis_options.yaml`.
 - Invoke `building-flutter-apps` skill FIRST.
-- `if (!ref.mounted) return;` after every `await` in a notifier; `if (!context.mounted) return;` after every `await` in a widget/State. Never bare `mounted` — lint fires → extract sync helper on State with `this.context`.
-- No `_buildXxx()` — extract widget classes. No hardcoded strings — use `*Strings` constants.
+- `if (!ref.mounted) return;` after every `await` in a notifier. `if (!context.mounted) return;` after every `await` in a widget/State. Never bare `mounted`; the lint fires. Extract a sync helper on State with `this.context`.
+- No `_buildXxx()`. Extract widget classes. No hardcoded strings. Use `*Strings` constants.
 - `ref.watch` in build, `ref.read` in callbacks. Riverpod 3.x codegen naming: `FooNotifier` → `fooProvider`. No `shrinkWrap: true` on `ListView`/`GridView`.
 
 #### React/Next
@@ -270,18 +270,18 @@ I also use `.claude/rules/` for stack-specific enforcement. Loaded via `@` impor
 - Invoke `vercel-react-best-practices` skill FIRST.
 - Server Components default. `"use client"` only for interaction.
 - Heavy compute (`find`/`filter`/`sort`/tz/O(n) scans) → `useMemo` with stable deps. Never in `.map()` callbacks, JSX attrs, or render body.
-- No `enum` — use `as const` objects. Status variants → `Record<Status, Variant>` map, not ternary chains.
+- No `enum`. Use `as const` objects. Status variants → `Record<Status, Variant>` map, not ternary chains.
 
 #### Appwrite
 - Scope: any TablesDB/Auth/Storage/Functions/Realtime work.
 - Invoke `appwrite-backend` skill FIRST.
 - Backend compliance agent must: grep all `Query.select([...])` calls, extract field names, fetch live schema via Appwrite CLI (`appwrite databases list-attributes --database-id <id> --table-id <id>`), flag selected fields not in collection attrs, flag missing indexes on queried fields.
 
-Copy the **structure**, not the content. Each rule starts with `Invoke <skill> FIRST` — that's the load-bearing part. Swap in your own stacks — the point is one skill-gated rule file per framework you actually ship, not these specific three.
+Copy the **structure**, not the content. Each rule opens with `Invoke <skill> FIRST`. That's the load-bearing line. Swap in your own stacks. The point is one skill-gated rule file per framework you actually ship, not these specific three.
 
 ### Additional hooks
 
-Four more hooks in the production config: `flutter-ctx-redirect` (PreToolUse Bash — pipes Flutter/Dart tool output through context-mode); `memory-repo-symlink` (SessionStart — scopes agent memory to the current project); `sync-copilot-on-edit` + `sync-runner-tools-on-edit` (PostToolUse Edit|Write|MultiEdit — mirror slash commands into VS Code Copilot prompts and rewrite e2e runner tool-allowlists after each edit, working around subagent MCP inheritance bug [#30280](https://github.com/anthropics/claude-code/issues/30280)).
+Four more hooks live in the production config. `flutter-ctx-redirect` (PreToolUse Bash) pipes Flutter/Dart tool output through context-mode. `memory-repo-symlink` (SessionStart) scopes agent memory to the current project. `sync-copilot-on-edit` and `sync-runner-tools-on-edit` (both PostToolUse Edit|Write|MultiEdit) mirror slash commands into VS Code Copilot prompts and rewrite e2e runner tool-allowlists after each edit. The pair also works around subagent MCP inheritance bug [#30280](https://github.com/anthropics/claude-code/issues/30280).
 
 ### Slash commands
 
@@ -299,7 +299,7 @@ Beyond the core hooks: `/unleash` spawns the full agent review swarm in parallel
 
 ## Custom Status Line
 
-Colour-coded dashboard — single line shows user, cwd, branch, model, context %, 5-hour usage %, 7-day usage %, and time:
+Colour-coded dashboard. One line, every signal: user, cwd, branch, model, context %, 5-hour usage %, 7-day usage %, clock.
 
 ```
 user in ~/project on  main │ ⬡ o4.7 │ ctx ████░░░░ 48% │ 5h ██░░░░░░ 23% │ 7d █░░░░░░░ 12% │ 09:59
@@ -324,7 +324,7 @@ git clone https://github.com/sgaabdu4/claude-code-tips.git
 cd claude-code-tips && chmod +x install.sh && ./install.sh
 ```
 
-The installer is intentionally a power-user default. It installs Headroom (bundles RTK), codebase-memory-mcp, context-mode plugin, Caveman plugin, all hooks, slash commands, stack rule templates, `bin/` helpers, statusline, `settings.json`, and shell wrappers (fish/bash/zsh). It does not ship or overwrite private subagent definitions in `~/.claude/agents/`. Backs up your existing `~/.claude/settings.json` first.
+The installer is opinionated and ships a power-user default. It drops in Headroom (which bundles RTK), codebase-memory-mcp, the context-mode plugin, the Caveman plugin, every hook, the slash commands, stack rule templates, `bin/` helpers, statusline, `settings.json`, and shell wrappers (fish/bash/zsh). It will not ship or overwrite private subagent definitions in `~/.claude/agents/`. Your existing `~/.claude/settings.json` is backed up before anything is written.
 
 Escape hatches:
 
@@ -347,9 +347,9 @@ With 3h sessions instead of 30min, multi-model pipelines stop hitting limits. Mi
 4. **Review round 2**: a different intelligent model for a cross-model second opinion. I use Codex (GPT-5.5) because the vendor switch catches blind spots a same-family reviewer misses, but another Claude or Gemini works fine.
 5. **E2E**: same principle: any strong model driving a browser. Codex + VS Code integrated browser works; so does Claude via [Agent Browser's `dogfood` skill](https://github.com/vercel-labs/agent-browser) (clicks every button, tests forms with edge cases, **records video when it finds a potential bug**). For Flutter, the official [Dart MCP](https://docs.flutter.dev/tools/mcp) + Flutter Driver lets the LLM drive real devices end-to-end.
 
-**Model choice, honestly:** it's interchangeable. Opus 4.7 high+ for plan and implement is my preference; any GPT-5.3+ Codex (high/xHigh) or same-class Claude works for review and E2E. Cross-vendor review catches more than same-vendor review. The only floor is "intelligent enough" — don't review Opus output with Haiku. For background subagents (research, audit, refactor) Sonnet 4.6 via `CLAUDE_CODE_SUBAGENT_MODEL` is the sweet spot — 60% cheaper than Opus, plenty smart, with per-agent Opus override for high-stakes work.
+**Model choice, honestly:** swap them out and you'd barely notice. Opus 4.7 high+ for plan and implement is what I run. Any GPT-5.3+ Codex (high/xHigh) or same-class Claude covers review and E2E. Cross-vendor review catches more than same-vendor review. The only floor is "intelligent enough." Don't review Opus output with Haiku. For background subagents (research, audit, refactor) Sonnet 4.6 via `CLAUDE_CODE_SUBAGENT_MODEL` is the sweet spot. 60% cheaper than Opus, plenty smart, with per-agent Opus override for high-stakes work.
 
-Tavily stays hot in the session for live research. docs/signatures/versions never trust training.
+Tavily stays hot in the session for live research. Never trust training data for docs, signatures, or versions.
 
 Other things that moved the needle:
 
@@ -357,10 +357,10 @@ Other things that moved the needle:
 - **CLI over MCP**: ripped out Tavily + Appwrite MCP servers in favour of their CLIs (`tvly`, `appwrite`). Paired with context-mode, same power, way less context bloat.
 - **Only 2 MCP servers:** `codebase-memory-mcp` + `context-mode`. Everything else is CLI or hooks.
 - **Fluid Voice** for dictation (Parakeet/Nvidia under the hood): beats stock dictation because it AI-edits as you speak.
-- **Measure what you're saving.** [Codeburn](https://github.com/getagentseal/codeburn) is a TUI dashboard that shows per-session token cost across Claude Code / Codex / Cursor. Closes the loop. you know when the stack is actually paying off.
+- **Measure what you're saving.** [Codeburn](https://github.com/getagentseal/codeburn) is a TUI dashboard that shows per-session token cost across Claude Code, Codex, and Cursor. Closes the loop. You can see when the stack is actually paying off.
 
 ---
 
 ## Closer
 
-Don't *tell* Claude to be efficient. *enforce* it. Hooks that block wasteful patterns beat 1000 words of CLAUDE.md. Claude follows the path of least resistance. Make the efficient path the only path.
+Don't *tell* Claude to be efficient. *Enforce* it. One hook that blocks a wasteful pattern beats 1,000 words of CLAUDE.md. Claude takes the path of least resistance every time. Make the efficient path the only path that exists.
