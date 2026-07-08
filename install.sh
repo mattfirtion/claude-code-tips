@@ -224,7 +224,10 @@ if [[ -n "$CBM_OS" && -n "$CBM_ARCH" ]]; then
     if [[ -f "$CBM_TMP/codebase-memory-mcp" ]]; then
       mv "$CBM_TMP/codebase-memory-mcp" "$HOME/.local/bin/codebase-memory-mcp"
       chmod +x "$HOME/.local/bin/codebase-memory-mcp"
-      "$HOME/.local/bin/codebase-memory-mcp" setup claude-code 2>/dev/null || true
+      # `install` (not the old `setup claude-code`) registers CBM with detected
+      # agents. Any unrecognized subcommand falls through to "run MCP server on
+      # stdio" and blocks forever waiting on stdin — hence </dev/null as a guard.
+      "$HOME/.local/bin/codebase-memory-mcp" install -y </dev/null >/dev/null 2>&1 || true
       echo "  ✓ CBM installed at ~/.local/bin/codebase-memory-mcp"
     else
       echo "  ⚠ CBM tarball extracted but binary not found — open an issue at the repo"
