@@ -20,6 +20,11 @@ Options:
   --sonnet             Use `model: sonnet` instead of Opus. Defaults effortLevel to high.
   --effort-level=LVL   Set effortLevel (low|medium|high|xhigh). Overrides the
                         --sonnet default; works standalone with Opus too.
+  --headroom-daemon    Install Headroom's proxy as a background service (launchd on
+                        macOS, systemd --user on Linux) instead of the per-session
+                        proxy `headroom wrap` starts on its own.
+  --headroom-daemon-port=PORT
+                        Port for the Headroom daemon proxy (default: 8787).
   -h, --help           Show this help.
 
 Examples:
@@ -27,6 +32,7 @@ Examples:
   ./install.sh --no-shell-wrapper
   ./install.sh --no-caveman --sonnet
   ./install.sh --sonnet --effort-level=medium
+  ./install.sh --headroom-daemon
   ./install.sh --check --no-caveman --sonnet
 EOF
 }
@@ -36,6 +42,8 @@ INSTALL_CAVEMAN=1
 INSTALL_SHELL_WRAPPER=1
 MODEL_PROFILE="power"
 EFFORT_LEVEL=""
+INSTALL_HEADROOM_DAEMON=0
+HEADROOM_DAEMON_PORT="8787"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -63,6 +71,18 @@ while [[ $# -gt 0 ]]; do
       EFFORT_LEVEL="${2:-}"
       shift 2
       ;;
+    --headroom-daemon)
+      INSTALL_HEADROOM_DAEMON=1
+      shift
+      ;;
+    --headroom-daemon-port=*)
+      HEADROOM_DAEMON_PORT="${1#*=}"
+      shift
+      ;;
+    --headroom-daemon-port)
+      HEADROOM_DAEMON_PORT="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       print_usage
       exit 0
@@ -86,6 +106,11 @@ esac
 # Preserve the historical --sonnet default (effortLevel: high) when the user
 # hasn't asked for a specific level.
 [[ -z "$EFFORT_LEVEL" && "$MODEL_PROFILE" == "sonnet" ]] && EFFORT_LEVEL="high"
+
+if ! [[ "$HEADROOM_DAEMON_PORT" =~ ^[0-9]+$ ]] || (( HEADROOM_DAEMON_PORT < 1 || HEADROOM_DAEMON_PORT > 65535 )); then
+  echo "Invalid --headroom-daemon-port: $HEADROOM_DAEMON_PORT (expected 1-65535)" >&2
+  exit 2
+fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETTINGS_SOURCE="$REPO_DIR/settings/settings.json"
@@ -190,6 +215,11 @@ if [[ "$MODEL_PROFILE" == "sonnet" ]]; then
 else
   echo "Model profile: opus/${EFFORT_LEVEL:-xhigh}"
 fi
+if [[ "$INSTALL_HEADROOM_DAEMON" -eq 1 ]]; then
+  echo "Headroom daemon: enabled (background proxy on port $HEADROOM_DAEMON_PORT)"
+else
+  echo "Headroom daemon: skipped (use --headroom-daemon to enable)"
+fi
 echo ""
 
 # ── 0. Sanity-check required tools ──
@@ -225,6 +255,113 @@ if [[ -n "$HR_CMD" ]]; then
     || echo "  ⚠ pip install failed. Run manually: $HR_CMD install --user 'headroom-ai[all]'"
 else
   echo "  ⚠ pip / pip3 not found — install Python 3 + pip, then run: pip install --user 'headroom-ai[all]'"
+fi
+
+# ── 1a. Install Headroom daemon (optional, --headroom-daemon) ──
+# `headroom wrap` starts its own proxy per session by default. Running
+# `headroom proxy --port $HEADROOM_DAEMON_PORT` as a persistent background
+# service instead means `headroom wrap` reuses it — no cold start per session,
+# and settings like HEADROOM_OUTPUT_SHAPER survive across sessions.
+install_headroom_daemon() {
+  local headroom_bin
+  headroom_bin="$(command -v headroom 2>/dev/null || true)"
+  if [[ -z "$headroom_bin" ]]; then
+    echo "  ⚠ 'headroom' not on PATH — install it first, then run manually:"
+    echo "    headroom proxy --port $HEADROOM_DAEMON_PORT"
+    return
+  fi
+
+  case "$(uname)" in
+    Darwin)
+      local plist_dir="$HOME/Library/LaunchAgents"
+      local plist="$plist_dir/com.headroom.proxy.plist"
+      mkdir -p "$plist_dir" "$HOME/Library/Logs"
+      local content
+      content="$(cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.headroom.proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$headroom_bin</string>
+    <string>proxy</string>
+    <string>--port</string>
+    <string>$HEADROOM_DAEMON_PORT</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$HOME/Library/Logs/headroom-proxy.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/Library/Logs/headroom-proxy.err.log</string>
+</dict>
+</plist>
+PLIST
+)"
+      if [[ -f "$plist" ]] && [[ "$(cat "$plist")" == "$content" ]]; then
+        echo "  ✓ Headroom daemon (launchd) already up to date — port $HEADROOM_DAEMON_PORT"
+        return
+      fi
+      [[ -f "$plist" ]] && cp "$plist" "$plist.bak.$(date +%s).$$"
+      printf '%s\n' "$content" > "$plist"
+      launchctl unload "$plist" 2>/dev/null || true
+      if launchctl load -w "$plist" 2>/dev/null; then
+        echo "  ✓ Headroom daemon installed (launchd) — proxy on port $HEADROOM_DAEMON_PORT"
+      else
+        echo "  ⚠ launchctl load failed — run manually: launchctl load -w $plist"
+      fi
+      ;;
+    Linux)
+      if ! command -v systemctl >/dev/null 2>&1; then
+        echo "  ⚠ systemctl not found — cannot install as a service. Run manually:"
+        echo "    headroom proxy --port $HEADROOM_DAEMON_PORT"
+        return
+      fi
+      local unit_dir="$HOME/.config/systemd/user"
+      local unit="$unit_dir/headroom-proxy.service"
+      mkdir -p "$unit_dir"
+      local content
+      content="$(cat <<UNIT
+[Unit]
+Description=Headroom API-layer compression proxy
+After=network.target
+
+[Service]
+ExecStart=$headroom_bin proxy --port $HEADROOM_DAEMON_PORT
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+UNIT
+)"
+      if [[ -f "$unit" ]] && [[ "$(cat "$unit")" == "$content" ]]; then
+        echo "  ✓ Headroom daemon (systemd --user) already up to date — port $HEADROOM_DAEMON_PORT"
+        return
+      fi
+      [[ -f "$unit" ]] && cp "$unit" "$unit.bak.$(date +%s).$$"
+      printf '%s\n' "$content" > "$unit"
+      systemctl --user daemon-reload
+      if systemctl --user enable --now headroom-proxy.service 2>/dev/null; then
+        echo "  ✓ Headroom daemon installed (systemd --user) — proxy on port $HEADROOM_DAEMON_PORT"
+      else
+        echo "  ⚠ systemctl --user enable failed (no user session? try: loginctl enable-linger \$USER) — run manually:"
+        echo "    systemctl --user enable --now headroom-proxy.service"
+      fi
+      ;;
+    *)
+      echo "  ⚠ Unsupported OS for daemon install: $(uname). Run manually: headroom proxy --port $HEADROOM_DAEMON_PORT"
+      ;;
+  esac
+}
+
+if [[ "$INSTALL_HEADROOM_DAEMON" -eq 1 ]]; then
+  echo "→ Installing Headroom daemon..."
+  install_headroom_daemon
 fi
 
 # ── 2. Install codebase-memory-mcp ──
@@ -596,6 +733,11 @@ echo "=== Installation Complete ==="
 echo ""
 echo "What was installed:"
 echo "  ✓ Headroom (API-layer compression, bundles RTK)"
+if [[ "$INSTALL_HEADROOM_DAEMON" -eq 1 ]]; then
+  echo "  ✓ Headroom daemon (background proxy, port $HEADROOM_DAEMON_PORT)"
+else
+  echo "  - Headroom daemon skipped; re-run with --headroom-daemon to install"
+fi
 echo "  ✓ codebase-memory-mcp (knowledge graph for code)"
 echo "  ✓ context-mode plugin (output virtualization)"
 if [[ "$INSTALL_CAVEMAN" -eq 1 ]]; then
