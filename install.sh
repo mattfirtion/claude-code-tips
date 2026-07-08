@@ -17,13 +17,16 @@ Options:
   --check              Validate repo settings/hooks/commands without installing.
   --no-shell-wrapper   Install Headroom, but do not modify your shell rc to wrap `claude`.
   --no-caveman         Skip Caveman plugin install and omit it from merged settings.
-  --sonnet             Use `model: sonnet` and `effortLevel: high` instead of Opus/xhigh.
+  --sonnet             Use `model: sonnet` instead of Opus. Defaults effortLevel to high.
+  --effort-level=LVL   Set effortLevel (low|medium|high|xhigh). Overrides the
+                        --sonnet default; works standalone with Opus too.
   -h, --help           Show this help.
 
 Examples:
   ./install.sh
   ./install.sh --no-shell-wrapper
   ./install.sh --no-caveman --sonnet
+  ./install.sh --sonnet --effort-level=medium
   ./install.sh --check --no-caveman --sonnet
 EOF
 }
@@ -32,6 +35,7 @@ CHECK_ONLY=0
 INSTALL_CAVEMAN=1
 INSTALL_SHELL_WRAPPER=1
 MODEL_PROFILE="power"
+EFFORT_LEVEL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,6 +55,14 @@ while [[ $# -gt 0 ]]; do
       MODEL_PROFILE="sonnet"
       shift
       ;;
+    --effort-level=*)
+      EFFORT_LEVEL="${1#*=}"
+      shift
+      ;;
+    --effort-level)
+      EFFORT_LEVEL="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       print_usage
       exit 0
@@ -62,6 +74,18 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "$EFFORT_LEVEL" in
+  ""|low|medium|high|xhigh) ;;
+  *)
+    echo "Invalid --effort-level: $EFFORT_LEVEL (expected low|medium|high|xhigh)" >&2
+    exit 2
+    ;;
+esac
+
+# Preserve the historical --sonnet default (effortLevel: high) when the user
+# hasn't asked for a specific level.
+[[ -z "$EFFORT_LEVEL" && "$MODEL_PROFILE" == "sonnet" ]] && EFFORT_LEVEL="high"
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETTINGS_SOURCE="$REPO_DIR/settings/settings.json"
@@ -81,7 +105,11 @@ prepare_settings_source() {
   fi
 
   if [[ "$MODEL_PROFILE" == "sonnet" ]]; then
-    filter="$filter | .model = \"sonnet\" | .effortLevel = \"high\""
+    filter="$filter | .model = \"sonnet\""
+  fi
+
+  if [[ -n "$EFFORT_LEVEL" ]]; then
+    filter="$filter | .effortLevel = \"$EFFORT_LEVEL\""
   fi
 
   if [[ "$filter" != "." ]]; then
@@ -158,9 +186,9 @@ else
   echo "Shell wrapper: skipped (--no-shell-wrapper)"
 fi
 if [[ "$MODEL_PROFILE" == "sonnet" ]]; then
-  echo "Model profile: sonnet/high (--sonnet)"
+  echo "Model profile: sonnet/$EFFORT_LEVEL (--sonnet)"
 else
-  echo "Model profile: opus/xhigh"
+  echo "Model profile: opus/${EFFORT_LEVEL:-xhigh}"
 fi
 echo ""
 
@@ -401,7 +429,7 @@ merge_settings_json() {
   local backup_suffix
   backup_suffix="$(date +%s).$$"
 
-  if jq -s --argjson skipCaveman "$skip_caveman" --arg modelProfile "$MODEL_PROFILE" '
+  if jq -s --argjson skipCaveman "$skip_caveman" --arg modelProfile "$MODEL_PROFILE" --arg effortLevel "$EFFORT_LEVEL" '
     .[0] as $ours | .[1] as $theirs |
     ($ours * $theirs)
     | .hooks = $ours.hooks
@@ -415,9 +443,8 @@ merge_settings_json() {
     | if $skipCaveman then
         del(.enabledPlugins["caveman@caveman"]) | del(.extraKnownMarketplaces.caveman)
       else . end
-    | if $modelProfile == "sonnet" then
-        .model = "sonnet" | .effortLevel = "high"
-      else . end
+    | if $modelProfile == "sonnet" then .model = "sonnet" else . end
+    | if $effortLevel != "" then .effortLevel = $effortLevel else . end
   ' "$source" "$target" > "$target.tmp" 2>/dev/null; then
     # Canonicalize both via jq -S for stable comparison (jq's `*` operator
     # is not output-byte-stable across runs; sorted-keys form is).
@@ -427,8 +454,8 @@ merge_settings_json() {
     else
       cp "$target" "$target.bak.$backup_suffix"
       mv "$target.tmp" "$target"
-      if [[ "$MODEL_PROFILE" == "sonnet" ]]; then
-        echo "  ✓ settings.json merged (sonnet/high forced by --sonnet; permissions preserved)"
+      if [[ "$MODEL_PROFILE" == "sonnet" || -n "$EFFORT_LEVEL" ]]; then
+        echo "  ✓ settings.json merged (model/effortLevel forced per flags; permissions preserved)"
       else
         echo "  ✓ settings.json merged (your model/effortLevel/permissions preserved if set)"
       fi
@@ -580,9 +607,9 @@ echo "  ✓ Stack rules dir created at ~/.claude/rules/ (empty by design — dro
 echo "  ✓ bin/ helper scripts (sync-copilot, sync-runner-tools)"
 echo "  ✓ Custom statusline"
 if [[ "$MODEL_PROFILE" == "sonnet" ]]; then
-  echo "  ✓ Optimized settings.json (sonnet/high profile)"
+  echo "  ✓ Optimized settings.json (sonnet/$EFFORT_LEVEL profile)"
 else
-  echo "  ✓ Optimized settings.json (opus/xhigh power profile)"
+  echo "  ✓ Optimized settings.json (opus/${EFFORT_LEVEL:-xhigh} power profile)"
 fi
 if [[ -n "$SHELL_INSTALLED" ]]; then
   echo "  ✓ Shell wrapper: $SHELL_INSTALLED"
